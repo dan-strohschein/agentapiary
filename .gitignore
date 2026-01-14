@@ -30,3 +30,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+build-docs/
+.github/
+.vscode/
+.DS_Store
+
+bin/
