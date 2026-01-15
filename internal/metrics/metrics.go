@@ -28,6 +28,8 @@ type Collector struct {
 	rateLimitExceeded        *prometheus.CounterVec
 	dlqMessagesAdded         *prometheus.CounterVec
 	dlqQueueSize             *prometheus.GaugeVec
+	webhookSent              *prometheus.CounterVec
+	webhookFailed            *prometheus.CounterVec
 
 	// Aggregated metrics per AgentSpec
 	aggregatedLatency map[string]*LatencyStats
@@ -154,6 +156,24 @@ func NewCollector(logger *zap.Logger) *Collector {
 		[]string{"namespace", "hive"},
 	)
 
+	// Webhook sent counter
+	webhookSent := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "apiary_webhook_sent_total",
+			Help: "Total webhooks sent",
+		},
+		[]string{"namespace", "hive", "event_type"},
+	)
+
+	// Webhook failed counter
+	webhookFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "apiary_webhook_failed_total",
+			Help: "Total webhook delivery failures",
+		},
+		[]string{"namespace", "hive", "event_type"},
+	)
+
 	registry.MustRegister(responseLatency)
 	registry.MustRegister(tokenUsage)
 	registry.MustRegister(queueDepth)
@@ -164,6 +184,8 @@ func NewCollector(logger *zap.Logger) *Collector {
 	registry.MustRegister(rateLimitExceeded)
 	registry.MustRegister(dlqMessagesAdded)
 	registry.MustRegister(dlqQueueSize)
+	registry.MustRegister(webhookSent)
+	registry.MustRegister(webhookFailed)
 
 	c := &Collector{
 		registry:                 registry,
@@ -289,6 +311,16 @@ func (c *Collector) RecordDLQMessageAdded(namespace, hive string) {
 // SetDLQQueueSize sets the current size of the dead letter queue.
 func (c *Collector) SetDLQQueueSize(namespace, hive string, size int) {
 	c.dlqQueueSize.WithLabelValues(namespace, hive).Set(float64(size))
+}
+
+// RecordWebhookSent records a webhook that was sent successfully.
+func (c *Collector) RecordWebhookSent(namespace, hive, eventType string) {
+	c.webhookSent.WithLabelValues(namespace, hive, eventType).Inc()
+}
+
+// RecordWebhookFailed records a webhook delivery failure.
+func (c *Collector) RecordWebhookFailed(namespace, hive, eventType string) {
+	c.webhookFailed.WithLabelValues(namespace, hive, eventType).Inc()
 }
 
 // GetLatencyStats returns aggregated latency statistics for an AgentSpec.

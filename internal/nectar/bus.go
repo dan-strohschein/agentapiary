@@ -4,6 +4,7 @@ package nectar
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +12,16 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
+
+// subjectForTopic constructs a NATS subject from a topic.
+// Optimized: Uses strings.Builder to avoid fmt.Sprintf overhead.
+func subjectForTopic(topic string) string {
+	var b strings.Builder
+	b.Grow(len(topic) + 7) // "nectar." + topic
+	b.WriteString("nectar.")
+	b.WriteString(topic)
+	return b.String()
+}
 
 // MessageBus provides message bus functionality for agent communication.
 type MessageBus interface {
@@ -64,38 +75,58 @@ type Config struct {
 	Port       int
 	Persistent bool
 	DataDir    string
+	// External NATS URLs (comma-separated). If provided, connects to external NATS cluster instead of starting embedded server.
+	// Example: "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
+	ExternalURLs string
 }
 
-// NewBus creates a new message bus with embedded NATS server.
+// NewBus creates a new message bus. If ExternalURLs is provided, connects to external NATS cluster.
+// Otherwise, starts an embedded NATS server (default behavior).
 func NewBus(cfg Config) (*Bus, error) {
-	opts := &server.Options{
-		Host:      "127.0.0.1",
-		Port:      cfg.Port,
-		JetStream: cfg.Persistent,
-		StoreDir:  cfg.DataDir,
-		MaxPayload: 10 * 1024 * 1024, // 10MB max message size
-	}
+	var (
+		conn       *nats.Conn
+		natsServer *server.Server
+		err        error
+	)
 
-	// Create and start NATS server
-	natsServer, err := server.NewServer(opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create NATS server: %w", err)
-	}
+	// Check if external NATS URLs are provided
+	if cfg.ExternalURLs != "" {
+		// Connect to external NATS cluster
+		conn, err = nats.Connect(cfg.ExternalURLs, nats.Name("apiary-nectar"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to external NATS cluster: %w", err)
+		}
+	} else {
+		// Start embedded NATS server (default behavior)
+		opts := &server.Options{
+			Host:       "127.0.0.1",
+			Port:       cfg.Port,
+			JetStream:  cfg.Persistent,
+			StoreDir:   cfg.DataDir,
+			MaxPayload: 10 * 1024 * 1024, // 10MB max message size
+		}
 
-	// Start server in goroutine
-	go natsServer.Start()
+		// Create and start NATS server
+		natsServer, err = server.NewServer(opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create NATS server: %w", err)
+		}
 
-	// Wait for server to be ready
-	if !natsServer.ReadyForConnections(10 * time.Second) {
-		natsServer.Shutdown()
-		return nil, fmt.Errorf("NATS server failed to start")
-	}
+		// Start server in goroutine
+		go natsServer.Start()
 
-	// Connect to the server
-	conn, err := nats.Connect(natsServer.ClientURL())
-	if err != nil {
-		natsServer.Shutdown()
-		return nil, fmt.Errorf("failed to connect to NATS server: %w", err)
+		// Wait for server to be ready
+		if !natsServer.ReadyForConnections(10 * time.Second) {
+			natsServer.Shutdown()
+			return nil, fmt.Errorf("NATS server failed to start")
+		}
+
+		// Connect to the embedded server
+		conn, err = nats.Connect(natsServer.ClientURL())
+		if err != nil {
+			natsServer.Shutdown()
+			return nil, fmt.Errorf("failed to connect to NATS server: %w", err)
+		}
 	}
 
 	bus := &Bus{
@@ -112,20 +143,24 @@ func NewBus(cfg Config) (*Bus, error) {
 		js, err := conn.JetStream()
 		if err != nil {
 			conn.Close()
-			natsServer.Shutdown()
+			if natsServer != nil {
+				natsServer.Shutdown()
+			}
 			return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 		}
 
-		// Create stream for persistent messages
-		_, err = js.AddStream(&nats.StreamConfig{
-			Name:     "NECTAR",
-			Subjects: []string{"nectar.>"},
-			Storage:  nats.FileStorage,
-		})
-		if err != nil && err.Error() != "stream name already in use" {
-			conn.Close()
-			natsServer.Shutdown()
-			return nil, fmt.Errorf("failed to create JetStream stream: %w", err)
+		// Create stream for persistent messages (only for embedded server, external cluster should have stream already)
+		if natsServer != nil {
+			_, err = js.AddStream(&nats.StreamConfig{
+				Name:     "NECTAR",
+				Subjects: []string{"nectar.>"},
+				Storage:  nats.FileStorage,
+			})
+			if err != nil && !strings.Contains(err.Error(), "stream name already in use") {
+				conn.Close()
+				natsServer.Shutdown()
+				return nil, fmt.Errorf("failed to create JetStream stream: %w", err)
+			}
 		}
 	}
 
@@ -147,12 +182,12 @@ func (b *Bus) Publish(ctx context.Context, topic string, msg *Message) error {
 			return fmt.Errorf("failed to get JetStream context: %w", err)
 		}
 
-		subject := fmt.Sprintf("nectar.%s", topic)
+		subject := subjectForTopic(topic)
 		_, err = js.Publish(subject, data)
 		return err
 	}
 
-	subject := fmt.Sprintf("nectar.%s", topic)
+	subject := subjectForTopic(topic)
 	return b.conn.Publish(subject, data)
 }
 
@@ -224,7 +259,7 @@ func (b *Bus) Subscribe(ctx context.Context, topic string, handler MessageHandle
 
 // QueueSubscribe subscribes to a topic with queue group for load balancing.
 func (b *Bus) QueueSubscribe(ctx context.Context, topic, queue string, handler MessageHandler) (Subscription, error) {
-	subject := fmt.Sprintf("nectar.%s", topic)
+	subject := subjectForTopic(topic)
 
 	var sub *nats.Subscription
 	var err error
@@ -288,9 +323,14 @@ func (b *Bus) QueueSubscribe(ctx context.Context, topic, queue string, handler M
 		}
 	}
 
-	// Track subscription
+	// Track subscription - optimized: use strings.Builder instead of fmt.Sprintf
 	b.mu.Lock()
-	b.subs[fmt.Sprintf("%s:%s", topic, queue)] = sub
+	var key strings.Builder
+	key.Grow(len(topic) + len(queue) + 1)
+	key.WriteString(topic)
+	key.WriteByte(':')
+	key.WriteString(queue)
+	b.subs[key.String()] = sub
 	b.mu.Unlock()
 
 	return &subscription{sub: sub}, nil

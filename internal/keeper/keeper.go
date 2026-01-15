@@ -12,10 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agentapiary/apiary/internal/audit"
 	"github.com/agentapiary/apiary/internal/comb"
 	"github.com/agentapiary/apiary/internal/guardrails"
 	"github.com/agentapiary/apiary/internal/metrics"
 	"github.com/agentapiary/apiary/internal/nectar"
+	"github.com/agentapiary/apiary/internal/webhook"
 	"github.com/agentapiary/apiary/pkg/apiary"
 	"github.com/agentapiary/apiary/pkg/waggle"
 	"go.uber.org/zap"
@@ -46,6 +48,10 @@ type Keeper struct {
 	outputValidator *guardrails.OutputValidator
 	rateLimiter     *guardrails.RateLimiter
 	hiveCache       *hiveCache // Cache for SessionID -> HiveName mapping
+	webhookMgr      *webhook.Manager // Webhook manager for guardrail violations
+	auditLogger     *audit.Logger // Audit logger for structured logging
+	relayCancel     context.CancelFunc // Cancel function for message relay goroutines
+	relayWg          sync.WaitGroup    // WaitGroup to track message relay goroutines
 }
 
 // combCache provides local caching for Comb operations.
@@ -209,7 +215,7 @@ type HealthStatus struct {
 }
 
 // NewKeeper creates a new Keeper instance.
-func NewKeeper(spec *apiary.AgentSpec, logger *zap.Logger, store apiary.ResourceStore, combStore comb.Comb, sessionID string) *Keeper {
+func NewKeeper(spec *apiary.AgentSpec, logger *zap.Logger, store apiary.ResourceStore, combStore comb.Comb, sessionID string, webhookMgr *webhook.Manager) *Keeper {
 	metricsCollector := metrics.NewCollector(logger)
 
 	// Initialize token budget tracker from guardrails config
@@ -269,6 +275,8 @@ func NewKeeper(spec *apiary.AgentSpec, logger *zap.Logger, store apiary.Resource
 		timeoutTracker: timeoutTracker,
 		outputValidator: outputValidator,
 		rateLimiter:    rateLimiter,
+		webhookMgr:     webhookMgr,
+		auditLogger:    audit.NewLogger(logger), // Initialize audit logger
 		health: &HealthStatus{
 			Healthy:   false,
 			Timestamp: time.Now(),
@@ -317,6 +325,35 @@ func (k *Keeper) Stop(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = k.server.Shutdown(shutdownCtx)
+	}
+
+	// Stop message relay goroutines
+	k.mu.Lock()
+	if k.relayCancel != nil {
+		k.relayCancel() // Cancel context to stop goroutines
+	}
+	// Unsubscribe from message bus
+	if k.busSubscription != nil {
+		_ = k.busSubscription.Unsubscribe()
+		k.busSubscription = nil
+	}
+	k.mu.Unlock()
+
+	// Wait for message relay goroutines to finish (with timeout)
+	relayDone := make(chan struct{})
+	go func() {
+		k.relayWg.Wait()
+		close(relayDone)
+	}()
+
+	select {
+	case <-relayDone:
+		k.logger.Info("Message relay goroutines stopped")
+	case <-ctx.Done():
+		k.logger.Warn("Timeout waiting for message relay goroutines to stop")
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		k.logger.Warn("Timeout waiting for message relay goroutines to stop")
 	}
 
 	// Stop agent process
@@ -418,6 +455,7 @@ func (k *Keeper) startHealthServer() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", k.handleHealth)
 	mux.HandleFunc("/comb/", k.handleComb)
+	mux.HandleFunc("/exec", k.handleExec)
 
 	k.server = &http.Server{
 		Addr:    ":8080",
@@ -472,6 +510,109 @@ func (k *Keeper) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+// handleExec handles exec requests to execute commands in the agent process.
+func (k *Keeper) handleExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Command []string `json:"command"`
+		Stdin   bool     `json:"stdin,omitempty"`
+		TTY     bool     `json:"tty,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Command) == 0 {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Execute command in the agent's environment
+	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
+	
+	// Use the same working directory and environment as the agent
+	k.mu.RLock()
+	if k.process != nil {
+		cmd.Dir = k.process.Dir
+		cmd.Env = k.process.Env
+	}
+	k.mu.RUnlock()
+
+	// Set up I/O
+	if req.Stdin {
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to create stdin pipe: %v", err), http.StatusInternalServerError)
+			return
+		}
+		go func() {
+			defer stdinPipe.Close()
+			io.Copy(stdinPipe, r.Body)
+		}()
+	}
+
+	var stdout, stderr io.ReadCloser
+	var err error
+	stdout, err = cmd.StdoutPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create stdout pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	stderr, err = cmd.StderrPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create stderr pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		http.Error(w, fmt.Sprintf("failed to start command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Stream output
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+
+	// Stream stdout and stderr
+	done := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(w, stdout)
+		done <- err
+	}()
+	go func() {
+		_, err := io.Copy(w, stderr)
+		done <- err
+	}()
+
+	// Wait for command to complete
+	cmdErr := cmd.Wait()
+	
+	// Wait for output streams to finish
+	<-done
+	<-done
+
+	// Set exit code in response header
+	if cmdErr != nil {
+		if exitError, ok := cmdErr.(*exec.ExitError); ok {
+			w.Header().Set("X-Exit-Code", fmt.Sprintf("%d", exitError.ExitCode()))
+		} else {
+			w.Header().Set("X-Exit-Code", "1")
+		}
+	} else {
+		w.Header().Set("X-Exit-Code", "0")
+	}
+}
+
 // monitorHealth periodically checks the health of the agent process.
 func (k *Keeper) monitorHealth(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
@@ -519,6 +660,38 @@ func (k *Keeper) checkHealth() {
 	}
 
 	k.health.Timestamp = time.Now()
+
+	// Check for timeouts
+	if k.timeoutTracker != nil {
+		timedOut := k.timeoutTracker.CheckTimeouts()
+		if len(timedOut) > 0 {
+			k.health.Healthy = false
+			k.health.Message = fmt.Sprintf("%d request(s) timed out", len(timedOut))
+			// Audit log and fire webhook for timeout violations
+			for _, msgID := range timedOut {
+				// Audit log guardrail violation
+				if k.auditLogger != nil && k.spec != nil {
+					hiveName, _ := k.getHiveNameFromSession(context.Background(), k.sessionID)
+					timeoutErr := fmt.Errorf("request timed out")
+					k.auditLogger.LogGuardrailViolation(
+						"timeout",
+						k.spec.GetNamespace(),
+						hiveName,
+						k.spec.GetName(),
+						k.agentID,
+						k.sessionID,
+						msgID,
+						timeoutErr.Error(),
+						map[string]interface{}{
+							"timeoutSeconds": k.timeoutTracker.GetTimeoutSeconds(),
+						},
+					)
+				}
+				// Fire webhook for timeout violations
+				k.fireWebhook(context.Background(), "timeout", msgID, fmt.Errorf("request timed out"))
+			}
+		}
+	}
 }
 
 // getHiveNameFromSession looks up the Hive name for a SessionID.
@@ -563,13 +736,89 @@ func (k *Keeper) getHiveNameFromSession(ctx context.Context, sessionID string) (
 	// Extract Hive name from annotations
 	hiveName := ""
 	if session.GetAnnotations() != nil {
-		hiveName = session.GetAnnotations()["apiary.io/hive"]
+		hiveName = session.GetAnnotations()["apiary.io/hive-name"]
 	}
 
 	// Cache the result (even if empty, to avoid repeated lookups)
 	k.hiveCache.set(sessionID, hiveName)
 
 	return hiveName, nil
+}
+
+// getHiveWebhookConfig gets the webhook configuration for a Hive.
+func (k *Keeper) getHiveWebhookConfig(ctx context.Context, hiveName string) (string, string, error) {
+	if k.store == nil || hiveName == "" {
+		return "", "", nil // No store or no Hive
+	}
+
+	namespace := k.spec.GetNamespace()
+	resource, err := k.store.Get(ctx, "Hive", hiveName, namespace)
+	if err != nil {
+		return "", "", nil // Hive not found, no webhook
+	}
+
+	hive, ok := resource.(*apiary.Hive)
+	if !ok {
+		return "", "", nil // Not a Hive
+	}
+
+	webhookCfg := hive.Spec.Webhook
+	return webhookCfg.URL, webhookCfg.AuthHeader, nil
+}
+
+// fireWebhook fires a webhook event for a guardrail violation.
+func (k *Keeper) fireWebhook(ctx context.Context, eventType, messageID string, err error) {
+	if k.webhookMgr == nil {
+		return // No webhook manager
+	}
+
+	// Get Hive name from session
+	hiveName, _ := k.getHiveNameFromSession(ctx, k.sessionID)
+	if hiveName == "" {
+		return // No Hive associated
+	}
+
+	// Get webhook config from Hive
+	webhookURL, authHeader, _ := k.getHiveWebhookConfig(ctx, hiveName)
+	if webhookURL == "" {
+		return // No webhook configured
+	}
+
+	// Create webhook event
+	event := &webhook.Event{
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Namespace: k.spec.GetNamespace(),
+		HiveName:  hiveName,
+		AgentSpec: k.spec.GetName(),
+		DroneID:   k.agentID,
+		SessionID: k.sessionID,
+		MessageID: messageID,
+		Error:     err.Error(),
+		Details:   make(map[string]interface{}),
+	}
+
+	// Add event-specific details
+	switch eventType {
+	case "rate_limit":
+		if k.rateLimiter != nil {
+			event.Details["requestsPerMinute"] = k.rateLimiter.RequestsPerMinute()
+		}
+	case "token_budget":
+		if k.tokenTracker != nil {
+			// Add token usage details if available
+			event.Details["budgetExceeded"] = true
+		}
+	case "timeout":
+		if k.timeoutTracker != nil {
+			event.Details["activeRequests"] = k.timeoutTracker.GetActiveRequestCount()
+		}
+	case "output_validation":
+		event.Details["validationFailed"] = true
+	}
+
+	// Send webhook (fire and forget)
+	_ = k.webhookMgr.SendEvent(ctx, webhookURL, authHeader, event)
 }
 
 // SendMessage sends a message to the agent (for stdin interface).

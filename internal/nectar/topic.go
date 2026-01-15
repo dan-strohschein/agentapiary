@@ -1,17 +1,24 @@
 package nectar
 
 import (
-	"fmt"
+	"strings"
 )
 
 // PrefixTopic prefixes a topic with the Cell (namespace) name to ensure isolation.
 // Format: cell.{namespace}.{originalTopic}
+// Optimized: Uses strings.Builder to avoid fmt.Sprintf overhead.
 func PrefixTopic(namespace, topic string) string {
 	if namespace == "" {
 		// Empty namespace means no prefix (for system-level topics)
 		return topic
 	}
-	return fmt.Sprintf("cell.%s.%s", namespace, topic)
+	var b strings.Builder
+	b.Grow(len(namespace) + len(topic) + 6) // "cell." + namespace + "." + topic
+	b.WriteString("cell.")
+	b.WriteString(namespace)
+	b.WriteByte('.')
+	b.WriteString(topic)
+	return b.String()
 }
 
 // ExtractNamespace extracts the namespace from a prefixed topic.

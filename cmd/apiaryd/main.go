@@ -11,10 +11,14 @@ import (
 
 	"github.com/agentapiary/apiary/internal/api"
 	"github.com/agentapiary/apiary/internal/auth"
+	"github.com/agentapiary/apiary/internal/dlq"
 	"github.com/agentapiary/apiary/internal/launcher"
+	"github.com/agentapiary/apiary/internal/metrics"
 	"github.com/agentapiary/apiary/internal/queen"
 	"github.com/agentapiary/apiary/internal/scheduler"
+	"github.com/agentapiary/apiary/internal/session"
 	"github.com/agentapiary/apiary/internal/store/badger"
+	"github.com/agentapiary/apiary/internal/webhook"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +50,32 @@ func main() {
 	// Initialize launcher
 	launch := launcher.NewLauncher(logger, store)
 
+	// Initialize metrics collector
+	metricsCollector := metrics.NewCollector(logger)
+
+	// Initialize DLQ Manager
+	dlqMgr := dlq.NewManager(logger)
+
+	// Initialize webhook manager
+	// Note: webhookMgr should be passed to Keeper when Keepers are created
+	// For now, it's initialized here but will need to be integrated into the Keeper creation flow
+	webhookMgr := webhook.NewManager(webhook.Config{
+		Timeout:   10 * time.Second,
+		MaxRetries: 3,
+		RetryDelay: 1 * time.Second,
+		Logger:    logger,
+	}, metricsCollector)
+	_ = webhookMgr // TODO: Pass to Keeper when Keepers are created
+
+	// Initialize session manager
+	sessionMgr := session.NewManager(session.Config{
+		Store:  store,
+		Logger: logger,
+	})
+	if err := sessionMgr.Start(context.Background()); err != nil {
+		logger.Fatal("Failed to start session manager", zap.Error(err))
+	}
+
 	// Initialize Queen
 	q := queen.NewQueen(queen.Config{
 		Store:     store,
@@ -59,10 +89,13 @@ func main() {
 
 	// Initialize API server
 	apiServer, err := api.NewServer(api.Config{
-		Port:   *port,
-		Store:  store,
-		RBAC:   rbac,
-		Logger: logger,
+		Port:       *port,
+		Store:      store,
+		SessionMgr: sessionMgr,
+		Metrics:    metricsCollector,
+		RBAC:       rbac,
+		DLQManager: dlqMgr,
+		Logger:     logger,
 	})
 	if err != nil {
 		logger.Fatal("Failed to create API server", zap.Error(err))

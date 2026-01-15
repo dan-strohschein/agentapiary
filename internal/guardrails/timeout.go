@@ -87,6 +87,18 @@ func (t *TimeoutTracker) GetActiveRequestCount() int {
 	return len(t.activeRequests)
 }
 
+// GetTimeoutSeconds returns the configured timeout in seconds.
+func (t *TimeoutTracker) GetTimeoutSeconds() int {
+	if t == nil {
+		return 0
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.timeoutSeconds
+}
+
 // Clear clears all active requests (useful for cleanup).
 func (t *TimeoutTracker) Clear() {
 	if t == nil {

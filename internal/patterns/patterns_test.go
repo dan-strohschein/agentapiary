@@ -227,3 +227,174 @@ func TestNewOrchestrator(t *testing.T) {
 	assert.True(t, ok)
 	assert.NotNil(t, p)
 }
+
+func createTestHiveWithPatternSegments() *apiary.Hive {
+	return &apiary.Hive{
+		TypeMeta: apiary.TypeMeta{
+			APIVersion: "apiary.io/v1",
+			Kind:       "Hive",
+		},
+		ObjectMeta: apiary.ObjectMeta{
+			Name:      "test-composed-hive",
+			Namespace: "default",
+		},
+		Spec: apiary.HiveSpec{
+			PatternSegments: []apiary.PatternSegment{
+				{
+					Name:    "event-source",
+					Pattern: "event-driven",
+					Config: map[string]interface{}{
+						"eventSource": "tasks",
+						"subscribers": []interface{}{
+							map[string]interface{}{
+								"agentID": "agent1",
+								"filter": map[string]interface{}{
+									"type": "task",
+								},
+							},
+						},
+					},
+				},
+				{
+					Name:    "pipeline-processor",
+					Pattern: "pipeline",
+					Config: map[string]interface{}{
+						"stages": []interface{}{
+							map[string]interface{}{
+								"name":     "stage1",
+								"agentRef": "agent2",
+								"replicas": float64(1),
+							},
+							map[string]interface{}{
+								"name":     "stage2",
+								"agentRef": "agent3",
+								"replicas": float64(1),
+							},
+						},
+					},
+				},
+				{
+					Name:    "swarm-aggregator",
+					Pattern: "swarm",
+					Config: map[string]interface{}{
+						"agentIDs": []interface{}{"agent4", "agent5"},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestComposedPattern_Initialize(t *testing.T) {
+	hive := createTestHiveWithPatternSegments()
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	composed := NewComposedPattern(hive, bus, logger)
+
+	err := composed.Initialize()
+	require.NoError(t, err)
+
+	composed.mu.RLock()
+	assert.Equal(t, 3, len(composed.segments))
+	assert.Equal(t, "event-source", composed.segments[0].Segment.Name)
+	assert.Equal(t, "pipeline-processor", composed.segments[1].Segment.Name)
+	assert.Equal(t, "swarm-aggregator", composed.segments[2].Segment.Name)
+	composed.mu.RUnlock()
+}
+
+func TestComposedPattern_Initialize_EmptySegments(t *testing.T) {
+	hive := &apiary.Hive{
+		TypeMeta: apiary.TypeMeta{
+			APIVersion: "apiary.io/v1",
+			Kind:       "Hive",
+		},
+		ObjectMeta: apiary.ObjectMeta{
+			Name:      "test-hive",
+			Namespace: "default",
+		},
+		Spec: apiary.HiveSpec{
+			PatternSegments: []apiary.PatternSegment{},
+		},
+	}
+
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	composed := NewComposedPattern(hive, bus, logger)
+
+	err := composed.Initialize()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no pattern segments specified")
+}
+
+func TestComposedPattern_Start(t *testing.T) {
+	hive := createTestHiveWithPatternSegments()
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	composed := NewComposedPattern(hive, bus, logger)
+
+	ctx := context.Background()
+	err := composed.Start(ctx)
+	require.NoError(t, err)
+	defer composed.Stop(ctx)
+
+	composed.mu.RLock()
+	assert.Equal(t, ComposedPatternStatusRunning, composed.state.Status)
+	assert.Equal(t, 3, len(composed.segments))
+	composed.mu.RUnlock()
+}
+
+func TestComposedPattern_Stop(t *testing.T) {
+	hive := createTestHiveWithPatternSegments()
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	composed := NewComposedPattern(hive, bus, logger)
+
+	ctx := context.Background()
+	err := composed.Start(ctx)
+	require.NoError(t, err)
+
+	err = composed.Stop(ctx)
+	require.NoError(t, err)
+
+	composed.mu.RLock()
+	assert.Equal(t, ComposedPatternStatusCompleted, composed.state.Status)
+	assert.NotNil(t, composed.state.CompletedAt)
+	composed.mu.RUnlock()
+}
+
+func TestNewOrchestrator_WithPatternSegments(t *testing.T) {
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	hive := createTestHiveWithPatternSegments()
+
+	orch, err := NewOrchestrator(hive, bus, logger)
+	require.NoError(t, err)
+
+	composed, ok := orch.(*ComposedPattern)
+	assert.True(t, ok)
+	assert.NotNil(t, composed)
+}
+
+func TestNewOrchestrator_BackwardCompatibility(t *testing.T) {
+	bus, cleanup := setupTestBus(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+
+	// Test that single Pattern field still works (backward compatibility)
+	hive := createTestHive("pipeline")
+	orch, err := NewOrchestrator(hive, bus, logger)
+	require.NoError(t, err)
+	_, ok := orch.(*Pipeline)
+	assert.True(t, ok)
+}

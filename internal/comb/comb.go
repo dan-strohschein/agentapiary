@@ -4,6 +4,8 @@ package comb
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,8 +75,14 @@ func NewStore(logger *zap.Logger) *Store {
 }
 
 // sessionKey constructs a session-scoped key.
+// Optimized: Uses strings.Builder to avoid fmt.Sprintf overhead.
 func (s *Store) sessionKey(sessionID, key string) string {
-	return fmt.Sprintf("%s:%s", sessionID, key)
+	var b strings.Builder
+	b.Grow(len(sessionID) + len(key) + 1) // Pre-allocate: sessionID + ":" + key
+	b.WriteString(sessionID)
+	b.WriteByte(':')
+	b.WriteString(key)
+	return b.String()
 }
 
 // Get retrieves a value by key for a session.
@@ -321,15 +329,16 @@ func (s *Store) Incr(ctx context.Context, sessionID, key string) (int64, error) 
 	ent.mu.Lock()
 	defer ent.mu.Unlock()
 
-	// Parse current value
-	var current int64
-	if _, err := fmt.Sscanf(ent.value, "%d", &current); err != nil {
+	// Parse current value - optimized: use strconv instead of fmt.Sscanf
+	current, err := strconv.ParseInt(ent.value, 10, 64)
+	if err != nil {
 		return 0, fmt.Errorf("value is not a number: %s", ent.value)
 	}
 
 	// Increment
 	current++
-	ent.value = fmt.Sprintf("%d", current)
+	// Optimized: use strconv.FormatInt instead of fmt.Sprintf
+	ent.value = strconv.FormatInt(current, 10)
 
 	return current, nil
 }

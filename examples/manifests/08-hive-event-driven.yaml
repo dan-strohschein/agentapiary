@@ -1,0 +1,32 @@
+apiVersion: apiary.io/v1
+kind: Hive
+metadata:
+  name: event-driven-hive
+  namespace: default
+  labels:
+    app: event-driven
+    pattern: event-driven
+spec:
+  poolMode: warm
+  warmPoolSize: 1
+  pattern: event-driven
+  stages:
+    - name: subscriber1
+      agentRef: echo-agent
+      replicas: 2
+    - name: subscriber2
+      agentRef: llm-agent
+      replicas: 1
+  routing:
+    deadLetterTopic: dlq/event-driven-hive
+    retryPolicy:
+      maxRetries: 3
+      initialDelaySeconds: 1
+      maxDelaySeconds: 60
+  guardrails:
+    responseTimeoutSeconds: 30
+    rateLimitPerMinute: 100
+  webhook:
+    url: https://example.com/webhook
+    events:
+      - guardrail_violation

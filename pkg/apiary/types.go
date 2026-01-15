@@ -203,10 +203,35 @@ type HiveSpec struct {
 	PoolMode  string         `json:"poolMode,omitempty"` // cold, warm, hybrid
 	WarmPoolSize int         `json:"warmPoolSize,omitempty"`
 	Session   SessionConfig  `json:"session,omitempty"`
-	Pattern   string         `json:"pattern,omitempty"` // pipeline, hierarchical, swarm, event-driven
+	Pattern   string         `json:"pattern,omitempty"` // pipeline, hierarchical, swarm, event-driven (deprecated: use PatternSegments)
 	Stages    []Stage        `json:"stages,omitempty"`
 	Routing   RoutingConfig  `json:"routing,omitempty"`
 	Guardrails GuardrailConfig `json:"guardrails,omitempty"`
+	Webhook   WebhookConfig  `json:"webhook,omitempty"` // Webhook configuration for guardrail violations
+	// PatternSegments defines a sequence of patterns to compose together.
+	// If specified, patterns are executed in order, with each pattern's output
+	// routed to the next pattern's input. If empty, falls back to Pattern field.
+	PatternSegments []PatternSegment `json:"patternSegments,omitempty"`
+}
+
+// PatternSegment represents a single pattern in a composed workflow.
+type PatternSegment struct {
+	// Name is a unique identifier for this pattern segment.
+	Name string `json:"name"`
+	// Pattern is the pattern type: "pipeline", "hierarchical", "swarm", "event-driven"
+	Pattern string `json:"pattern"`
+	// Config contains pattern-specific configuration.
+	// For pipeline: stages
+	// For hierarchical: supervisor and worker IDs
+	// For swarm: agent IDs
+	// For event-driven: event source and subscribers
+	Config map[string]interface{} `json:"config,omitempty"`
+	// InputTopic is the NATS topic this segment subscribes to for input.
+	// If empty, uses the previous segment's output topic or the Hive's default input.
+	InputTopic string `json:"inputTopic,omitempty"`
+	// OutputTopic is the NATS topic this segment publishes output to.
+	// If empty, uses a default topic based on the segment name.
+	OutputTopic string `json:"outputTopic,omitempty"`
 }
 
 // Stage represents a stage in a pipeline pattern.
@@ -229,6 +254,12 @@ type RetryPolicy struct {
 	MaxRetries       int `json:"maxRetries"`
 	BackoffMultiplier int `json:"backoffMultiplier"`
 	InitialDelayMs   int `json:"initialDelayMs"`
+}
+
+// WebhookConfig defines webhook configuration for guardrail violations.
+type WebhookConfig struct {
+	URL         string `json:"url,omitempty"`         // Webhook URL to send notifications to
+	AuthHeader  string `json:"authHeader,omitempty"`  // Optional Authorization header (e.g., "Bearer token" or "Basic base64")
 }
 
 // SessionConfig defines session configuration.

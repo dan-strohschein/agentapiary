@@ -160,6 +160,47 @@ func TestServer_CreateAgentSpec(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, rec.Code)
 }
 
+func TestServer_Healthz(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	server.echo.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response map[string]string
+	err := json.Unmarshal(rec.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", response["status"])
+}
+
+func TestServer_Ready(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	rec := httptest.NewRecorder()
+
+	server.echo.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response map[string]string
+	err := json.Unmarshal(rec.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Equal(t, "ready", response["status"])
+}
+
+func TestServer_Ready_StoreUnavailable(t *testing.T) {
+	// This test would require mocking the store to simulate failure
+	// For now, we test the happy path - store unavailable scenario
+	// would require additional infrastructure
+	t.Skip("Requires store mocking to test store unavailability")
+}
+
 func TestServer_NotFound(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

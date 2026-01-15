@@ -1,0 +1,39 @@
+apiVersion: apiary.io/v1
+kind: Hive
+metadata:
+  name: pipeline-hive
+  namespace: default
+  labels:
+    app: pipeline
+    pattern: pipeline
+spec:
+  poolMode: warm
+  warmPoolSize: 2
+  pattern: pipeline
+  stages:
+    - name: stage1
+      agentRef: echo-agent
+      replicas: 2
+    - name: stage2
+      agentRef: llm-agent
+      replicas: 3
+    - name: stage3
+      agentRef: echo-agent
+      replicas: 1
+  session:
+    timeoutMinutes: 30
+    maxDurationMinutes: 120
+    persistOnTerminate: false
+  routing:
+    retryPolicy:
+      maxRetries: 3
+      initialDelaySeconds: 1
+      maxDelaySeconds: 60
+  guardrails:
+    responseTimeoutSeconds: 30
+    rateLimitPerMinute: 100
+  webhook:
+    url: https://example.com/webhook
+    events:
+      - guardrail_violation
+      - timeout

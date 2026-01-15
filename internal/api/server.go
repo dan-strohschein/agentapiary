@@ -3,14 +3,18 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agentapiary/apiary/internal/auth"
 	"github.com/agentapiary/apiary/internal/comb"
 	"github.com/agentapiary/apiary/internal/dlq"
 	"github.com/agentapiary/apiary/internal/metrics"
+	"github.com/agentapiary/apiary/internal/observability"
 	"github.com/agentapiary/apiary/internal/session"
 	"github.com/agentapiary/apiary/pkg/apiary"
 	"github.com/labstack/echo/v4"
@@ -33,14 +37,15 @@ type Server struct {
 
 // Config holds server configuration.
 type Config struct {
-	Port        int
-	Store       apiary.ResourceStore
-	SessionMgr  *session.Manager
-	Comb        comb.Comb
-	Metrics     *metrics.Collector
-	RBAC        *auth.RBAC
-	DLQManager  *dlq.Manager
-	Logger      *zap.Logger
+	Port           int
+	Store          apiary.ResourceStore
+	SessionMgr     *session.Manager
+	Comb           comb.Comb
+	Metrics        *metrics.Collector
+	RBAC           *auth.RBAC
+	DLQManager     *dlq.Manager
+	Logger         *zap.Logger
+	Observability  *observability.Observability
 }
 
 // NewServer creates a new API server.
@@ -51,8 +56,14 @@ func NewServer(cfg Config) (*Server, error) {
 	// Middleware
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
+	
+	// OpenTelemetry tracing middleware (must be before logging to add trace context)
+	if cfg.Observability != nil {
+		e.Use(tracingMiddleware(cfg.Observability))
+	}
+	
 	if cfg.Logger != nil {
-		e.Use(loggingMiddleware(cfg.Logger))
+		e.Use(loggingMiddleware(cfg.Logger, cfg.Observability))
 	}
 	
 	// Context validation middleware
@@ -88,6 +99,10 @@ func NewServer(cfg Config) (*Server, error) {
 
 // setupRoutes configures all API routes.
 func (s *Server) setupRoutes() {
+	// Health check endpoints (no auth required)
+	s.echo.GET("/healthz", s.healthz)
+	s.echo.GET("/ready", s.ready)
+
 	v1 := s.echo.Group("/api/v1")
 
 	// Cells (not namespaced)
@@ -153,6 +168,20 @@ func (s *Server) setupRoutes() {
 	ns.POST("/hives/:hive/dlq/:messageId/replay", s.replayDLQMessage)
 	ns.DELETE("/hives/:hive/dlq/:messageId", s.deleteDLQMessage)
 	ns.DELETE("/hives/:hive/dlq", s.clearDLQ)
+
+	// Logs
+	ns.GET("/drones/:id/logs", s.getDroneLogs)
+
+	// Exec
+	ns.POST("/drones/:id/exec", s.execDrone)
+
+	// Scale
+	ns.PUT("/agentspecs/:name/scale", s.scaleAgentSpec)
+	ns.PUT("/hives/:name/scale", s.scaleHive)
+
+	// Drain
+	ns.POST("/drones/:id/drain", s.drainDrone)
+	ns.POST("/agentspecs/:name/drain", s.drainAgentSpec)
 }
 
 // Start starts the API server.
@@ -165,8 +194,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.echo.Shutdown(ctx)
 }
 
-// loggingMiddleware creates a logging middleware.
-func loggingMiddleware(logger *zap.Logger) echo.MiddlewareFunc {
+// loggingMiddleware creates a logging middleware with trace correlation.
+func loggingMiddleware(logger *zap.Logger, obs *observability.Observability) echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		LogStatus:   true,
 		LogURI:       true,
@@ -175,14 +204,25 @@ func loggingMiddleware(logger *zap.Logger) echo.MiddlewareFunc {
 		LogLatency:   true,
 		LogRequestID: true,
 		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
-			logger.Info("request",
+			ctx := c.Request().Context()
+			
+			// Base log fields
+			fields := []zap.Field{
 				zap.String("id", v.RequestID),
 				zap.String("method", v.Method),
 				zap.String("uri", v.URI),
 				zap.Int("status", v.Status),
 				zap.Duration("latency", v.Latency),
 				zap.Error(v.Error),
-			)
+			}
+			
+			// Add trace correlation fields if observability is enabled
+			if obs != nil {
+				traceFields := observability.TraceContextFromContext(ctx)
+				fields = append(fields, traceFields...)
+			}
+			
+			logger.Info("request", fields...)
 			return nil
 		},
 	})
@@ -834,6 +874,567 @@ func (s *Server) deleteDrone(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// getDroneLogs handles GET /api/v1/cells/:namespace/drones/:id/logs.
+func (s *Server) getDroneLogs(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	id := c.Param("id")
+
+	// Get the Drone
+	resource, err := s.store.Get(ctx, "Drone", id, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	drone, ok := resource.(*apiary.Drone)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: "failed to cast resource to Drone",
+		})
+	}
+
+	// Extract Keeper address from Drone status
+	keeperAddr := ""
+	if drone.Status.KeeperAddr != "" {
+		keeperAddr = drone.Status.KeeperAddr
+	}
+
+	if keeperAddr == "" {
+		return c.JSON(http.StatusNotFound, errorResponse{
+			Error:   "not_found",
+			Message: "Keeper address not found for drone",
+		})
+	}
+
+	// Get query parameters
+	tail := c.QueryParam("tail")
+	since := c.QueryParam("since")
+	follow := c.QueryParam("follow") == "true"
+
+	// Build Keeper logs URL
+	logsURL := fmt.Sprintf("http://%s/logs", keeperAddr)
+	params := []string{}
+	if tail != "" {
+		params = append(params, fmt.Sprintf("tail=%s", tail))
+	}
+	if since != "" {
+		params = append(params, fmt.Sprintf("since=%s", since))
+	}
+	if len(params) > 0 {
+		logsURL += "?" + strings.Join(params, "&")
+	}
+
+	// For now, return the Keeper URL and a note that direct connection is needed
+	// In a full implementation, we'd proxy the logs through the API server
+	if follow {
+		// For streaming, we'd use Server-Sent Events or WebSocket
+		// For MVP, return an error suggesting to use the Keeper address directly
+		return c.JSON(http.StatusNotImplemented, errorResponse{
+			Error:   "not_implemented",
+			Message: "Streaming logs not yet implemented. Use Keeper address directly for now.",
+		})
+	}
+
+	// Fetch logs from Keeper
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logsURL, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: fmt.Sprintf("failed to create request: %v", err),
+		})
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return c.JSON(http.StatusBadGateway, errorResponse{
+			Error:   "bad_gateway",
+			Message: fmt.Sprintf("failed to fetch logs from Keeper: %v", err),
+		})
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return c.JSON(http.StatusBadGateway, errorResponse{
+			Error:   "bad_gateway",
+			Message: fmt.Sprintf("Keeper returned status %d: %s", resp.StatusCode, string(body)),
+		})
+	}
+
+	// Stream logs to response
+	c.Response().Header().Set(echo.HeaderContentType, "text/plain; charset=utf-8")
+	c.Response().WriteHeader(http.StatusOK)
+
+	_, err = io.Copy(c.Response(), resp.Body)
+	return err
+}
+
+// execDrone handles POST /api/v1/cells/:namespace/drones/:id/exec.
+func (s *Server) execDrone(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	id := c.Param("id")
+
+	// Get the Drone
+	resource, err := s.store.Get(ctx, "Drone", id, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	drone, ok := resource.(*apiary.Drone)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: "failed to cast resource to Drone",
+		})
+	}
+
+	// Extract Keeper address from Drone status
+	keeperAddr := ""
+	if drone.Status.KeeperAddr != "" {
+		keeperAddr = drone.Status.KeeperAddr
+	}
+
+	if keeperAddr == "" {
+		return c.JSON(http.StatusNotFound, errorResponse{
+			Error:   "not_found",
+			Message: "Keeper address not found for drone",
+		})
+	}
+
+	// Parse exec request
+	var execReq struct {
+		Command []string `json:"command"`
+		Stdin   bool     `json:"stdin,omitempty"`
+		TTY     bool     `json:"tty,omitempty"`
+	}
+
+	if err := c.Bind(&execReq); err != nil {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: err.Error(),
+		})
+	}
+
+	if len(execReq.Command) == 0 {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: "command is required",
+		})
+	}
+
+	// Build Keeper exec URL
+	execURL := fmt.Sprintf("http://%s/exec", keeperAddr)
+
+	// Create request body
+	reqBody := struct {
+		Command []string `json:"command"`
+		Stdin   bool     `json:"stdin"`
+		TTY     bool     `json:"tty"`
+	}{
+		Command: execReq.Command,
+		Stdin:   execReq.Stdin,
+		TTY:     execReq.TTY,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: fmt.Sprintf("failed to marshal request: %v", err),
+		})
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, execURL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: fmt.Sprintf("failed to create request: %v", err),
+		})
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Forward request body if stdin is enabled
+	if execReq.Stdin {
+		req.Body = c.Request().Body
+		req.ContentLength = c.Request().ContentLength
+	}
+
+	client := &http.Client{Timeout: 0} // No timeout for streaming
+	resp, err := client.Do(req)
+	if err != nil {
+		return c.JSON(http.StatusBadGateway, errorResponse{
+			Error:   "bad_gateway",
+			Message: fmt.Sprintf("failed to execute command in Keeper: %v", err),
+		})
+	}
+	defer resp.Body.Close()
+
+	// Forward exit code header
+	if exitCode := resp.Header.Get("X-Exit-Code"); exitCode != "" {
+		c.Response().Header().Set("X-Exit-Code", exitCode)
+	}
+
+	// Stream response
+	c.Response().Header().Set(echo.HeaderContentType, "application/octet-stream")
+	c.Response().WriteHeader(resp.StatusCode)
+
+	_, err = io.Copy(c.Response(), resp.Body)
+	return err
+}
+
+// scaleAgentSpec handles PUT /api/v1/cells/:namespace/agentspecs/:name/scale.
+func (s *Server) scaleAgentSpec(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	// Get the AgentSpec
+	resource, err := s.store.Get(ctx, "AgentSpec", name, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	spec, ok := resource.(*apiary.AgentSpec)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: "failed to cast resource to AgentSpec",
+		})
+	}
+
+	// Parse scale request
+	var scaleReq struct {
+		Replicas int `json:"replicas"`
+	}
+
+	if err := c.Bind(&scaleReq); err != nil {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: err.Error(),
+		})
+	}
+
+	// Validate replicas against min/max
+	if spec.Spec.Scaling.MinReplicas > 0 && scaleReq.Replicas < spec.Spec.Scaling.MinReplicas {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: fmt.Sprintf("replicas (%d) must be >= minReplicas (%d)", scaleReq.Replicas, spec.Spec.Scaling.MinReplicas),
+		})
+	}
+
+	if spec.Spec.Scaling.MaxReplicas > 0 && scaleReq.Replicas > spec.Spec.Scaling.MaxReplicas {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: fmt.Sprintf("replicas (%d) must be <= maxReplicas (%d)", scaleReq.Replicas, spec.Spec.Scaling.MaxReplicas),
+		})
+	}
+
+	// Update scaling config (set min and max to the desired replicas for manual scaling)
+	// This is a simplified approach - in production, you might want to track desired replicas separately
+	spec.Spec.Scaling.MinReplicas = scaleReq.Replicas
+	spec.Spec.Scaling.MaxReplicas = scaleReq.Replicas
+
+	// Update the AgentSpec
+	if err := s.store.Update(ctx, spec); err != nil {
+		return s.handleError(c, err)
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":  fmt.Sprintf("AgentSpec %s scaled to %d replicas", name, scaleReq.Replicas),
+		"replicas": scaleReq.Replicas,
+	})
+}
+
+// scaleHive handles PUT /api/v1/cells/:namespace/hives/:name/scale.
+func (s *Server) scaleHive(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	// Get the Hive
+	resource, err := s.store.Get(ctx, "Hive", name, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	hive, ok := resource.(*apiary.Hive)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: "failed to cast resource to Hive",
+		})
+	}
+
+	// Parse scale request
+	var scaleReq struct {
+		Stage    string `json:"stage,omitempty"`    // Optional: scale specific stage
+		Replicas int    `json:"replicas"`
+	}
+
+	if err := c.Bind(&scaleReq); err != nil {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: err.Error(),
+		})
+	}
+
+	if scaleReq.Replicas < 0 {
+		return c.JSON(http.StatusBadRequest, errorResponse{
+			Error:   "invalid_request",
+			Message: "replicas must be >= 0",
+		})
+	}
+
+	// If stage is specified, scale that stage; otherwise scale all stages
+	if scaleReq.Stage != "" {
+		found := false
+		for i := range hive.Spec.Stages {
+			if hive.Spec.Stages[i].Name == scaleReq.Stage {
+				hive.Spec.Stages[i].Replicas = scaleReq.Replicas
+				found = true
+				break
+			}
+		}
+		if !found {
+			return c.JSON(http.StatusNotFound, errorResponse{
+				Error:   "not_found",
+				Message: fmt.Sprintf("stage %s not found", scaleReq.Stage),
+			})
+		}
+	} else {
+		// Scale all stages
+		for i := range hive.Spec.Stages {
+			hive.Spec.Stages[i].Replicas = scaleReq.Replicas
+		}
+	}
+
+	// Update the Hive
+	if err := s.store.Update(ctx, hive); err != nil {
+		return s.handleError(c, err)
+	}
+
+	message := fmt.Sprintf("Hive %s scaled to %d replicas", name, scaleReq.Replicas)
+	if scaleReq.Stage != "" {
+		message = fmt.Sprintf("Hive %s stage %s scaled to %d replicas", name, scaleReq.Stage, scaleReq.Replicas)
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":  message,
+		"replicas": scaleReq.Replicas,
+	})
+}
+
+// drainDrone handles POST /api/v1/cells/:namespace/drones/:id/drain.
+func (s *Server) drainDrone(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	id := c.Param("id")
+
+	// Get the Drone
+	resource, err := s.store.Get(ctx, "Drone", id, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	drone, ok := resource.(*apiary.Drone)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, errorResponse{
+			Error:   "internal_error",
+			Message: "failed to cast resource to Drone",
+		})
+	}
+
+	// Parse drain request
+	var drainReq struct {
+		Force   bool   `json:"force,omitempty"`
+		Timeout string `json:"timeout,omitempty"`
+	}
+
+	if err := c.Bind(&drainReq); err != nil {
+		// Use defaults if bind fails (optional fields)
+		drainReq.Force = false
+		drainReq.Timeout = "30s"
+	}
+
+	// Parse timeout
+	timeoutDuration := 30 * time.Second
+	if drainReq.Timeout != "" {
+		var err error
+		timeoutDuration, err = time.ParseDuration(drainReq.Timeout)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, errorResponse{
+				Error:   "invalid_request",
+				Message: fmt.Sprintf("invalid timeout format: %v", err),
+			})
+		}
+	}
+
+	// Mark Drone as draining by adding annotation
+	if drone.ObjectMeta.Annotations == nil {
+		drone.ObjectMeta.Annotations = make(map[string]string)
+	}
+	drone.ObjectMeta.Annotations["draining"] = "true"
+	drone.ObjectMeta.Annotations["drain-requested-at"] = time.Now().Format(time.RFC3339)
+
+	// Update Drone phase to stopping
+	drone.Status.Phase = apiary.DronePhaseStopping
+
+	// Update the Drone
+	if err := s.store.Update(ctx, drone); err != nil {
+		return s.handleError(c, err)
+	}
+
+	// If force is true, delete immediately
+	if drainReq.Force {
+		if err := s.store.Delete(ctx, "Drone", id, namespace); err != nil {
+			return s.handleError(c, err)
+		}
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"message": fmt.Sprintf("Drone %s force drained and deleted", id),
+		})
+	}
+
+	// For graceful drain, we would:
+	// 1. Wait for in-flight requests to complete (via Keeper health check)
+	// 2. Remove from rotation (Queen will stop routing to it)
+	// 3. Wait for timeout or completion
+	// 4. Delete the Drone
+
+	// Create a context with timeout for draining
+	drainCtx, cancel := context.WithTimeout(ctx, timeoutDuration)
+	defer cancel()
+
+	// Poll for drain completion
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-drainCtx.Done():
+			// Timeout reached, force delete
+			if err := s.store.Delete(ctx, "Drone", id, namespace); err != nil {
+				return s.handleError(c, err)
+			}
+			return c.JSON(http.StatusOK, map[string]interface{}{
+				"message": fmt.Sprintf("Drone %s drained (timeout reached) and deleted", id),
+			})
+		case <-ticker.C:
+			// Check if Drone is ready to be deleted
+			// In a full implementation, we'd check Keeper health and in-flight requests
+			// For now, we'll wait a bit and then delete
+			updatedResource, err := s.store.Get(ctx, "Drone", id, namespace)
+			if err != nil {
+				// Drone already deleted
+				return c.JSON(http.StatusOK, map[string]interface{}{
+					"message": fmt.Sprintf("Drone %s drained and deleted", id),
+				})
+			}
+
+			updatedDrone, ok := updatedResource.(*apiary.Drone)
+			if !ok {
+				return c.JSON(http.StatusInternalServerError, errorResponse{
+					Error:   "internal_error",
+					Message: "failed to cast resource to Drone",
+				})
+			}
+
+			// Check if Drone is in stopped phase (ready to delete)
+			if updatedDrone.Status.Phase == apiary.DronePhaseStopped || updatedDrone.Status.Phase == apiary.DronePhaseFailed {
+				// Delete the Drone
+				if err := s.store.Delete(ctx, "Drone", id, namespace); err != nil {
+					return s.handleError(c, err)
+				}
+				return c.JSON(http.StatusOK, map[string]interface{}{
+					"message": fmt.Sprintf("Drone %s gracefully drained and deleted", id),
+				})
+			}
+		}
+	}
+}
+
+// drainAgentSpec handles POST /api/v1/cells/:namespace/agentspecs/:name/drain.
+func (s *Server) drainAgentSpec(c echo.Context) error {
+	ctx := c.Request().Context()
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	// Get the AgentSpec
+	_, err := s.store.Get(ctx, "AgentSpec", name, namespace)
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	// Parse drain request
+	var drainReq struct {
+		Force   bool   `json:"force,omitempty"`
+		Timeout string `json:"timeout,omitempty"`
+	}
+
+	if err := c.Bind(&drainReq); err != nil {
+		drainReq.Force = false
+		drainReq.Timeout = "30s"
+	}
+
+	// List all Drones for this AgentSpec
+	drones, err := s.store.List(ctx, "Drone", namespace, apiary.Labels{
+		"agentspec": name,
+	})
+	if err != nil {
+		return s.handleError(c, err)
+	}
+
+	drainedCount := 0
+	errors := []string{}
+
+	// Drain each Drone
+	for _, resource := range drones {
+		drone, ok := resource.(*apiary.Drone)
+		if !ok {
+			continue
+		}
+
+		// Mark Drone as draining
+		if drone.ObjectMeta.Annotations == nil {
+			drone.ObjectMeta.Annotations = make(map[string]string)
+		}
+		drone.ObjectMeta.Annotations["draining"] = "true"
+		drone.ObjectMeta.Annotations["drain-requested-at"] = time.Now().Format(time.RFC3339)
+		drone.Status.Phase = apiary.DronePhaseStopping
+
+		if err := s.store.Update(ctx, drone); err != nil {
+			errors = append(errors, fmt.Sprintf("failed to mark drone %s for draining: %v", drone.GetName(), err))
+			continue
+		}
+
+		// Delete immediately if force, otherwise let graceful drain happen
+		if drainReq.Force {
+			if err := s.store.Delete(ctx, "Drone", drone.GetName(), namespace); err != nil {
+				errors = append(errors, fmt.Sprintf("failed to delete drone %s: %v", drone.GetName(), err))
+			} else {
+				drainedCount++
+			}
+		} else {
+			// For graceful drain, we'd wait for completion
+			// For now, mark as draining and let Queen handle it
+			drainedCount++
+		}
+	}
+
+	message := fmt.Sprintf("Drained %d Drone(s) for AgentSpec %s", drainedCount, name)
+	if len(errors) > 0 {
+		message += fmt.Sprintf(" (%d errors)", len(errors))
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":      message,
+		"drainedCount": drainedCount,
+		"errors":       errors,
+	})
+}
+
 // listSessions handles GET /api/v1/cells/:namespace/sessions.
 func (s *Server) listSessions(c echo.Context) error {
 	ctx := c.Request().Context()
@@ -1326,4 +1927,35 @@ func (s *Server) clearDLQ(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+// healthz handles GET /healthz (liveness probe).
+// Returns 200 OK if the server is running.
+func (s *Server) healthz(c echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]string{
+		"status": "ok",
+	})
+}
+
+// ready handles GET /ready (readiness probe).
+// Returns 200 OK if the server is ready to serve traffic (store is accessible).
+// Returns 503 Service Unavailable if dependencies are not ready.
+func (s *Server) ready(c echo.Context) error {
+	ctx, cancel := context.WithTimeout(c.Request().Context(), 2*time.Second)
+	defer cancel()
+
+	// Check store connectivity by attempting to list resources
+	_, err := s.store.List(ctx, "Cell", "", nil)
+	if err != nil {
+		s.logger.Warn("Readiness check failed: store not accessible", zap.Error(err))
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"status":  "not_ready",
+			"reason":  "store_unavailable",
+			"message": "Store is not accessible",
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"status": "ready",
+	})
 }

@@ -1,0 +1,51 @@
+apiVersion: apiary.io/v1
+kind: Hive
+metadata:
+  name: composed-hive
+  namespace: default
+  labels:
+    app: composed
+    pattern: composed
+spec:
+  poolMode: warm
+  warmPoolSize: 3
+  # PatternSegments allows composing multiple patterns
+  patternSegments:
+    - name: event-stage
+      pattern: event-driven
+      config:
+        subscribers:
+          - agentRef: echo-agent
+            replicas: 2
+      outputTopic: events/output
+    - name: pipeline-stage
+      pattern: pipeline
+      inputTopic: events/output
+      config:
+        stages:
+          - name: stage1
+            agentRef: llm-agent
+            replicas: 2
+          - name: stage2
+            agentRef: echo-agent
+            replicas: 1
+      outputTopic: pipeline/output
+    - name: swarm-stage
+      pattern: swarm
+      inputTopic: pipeline/output
+      config:
+        agents:
+          - agentRef: echo-agent
+            replicas: 2
+  session:
+    timeoutMinutes: 45
+    maxDurationMinutes: 240
+  guardrails:
+    responseTimeoutSeconds: 60
+    rateLimitPerMinute: 150
+    tokenBudgetPerRequest: 100000
+  webhook:
+    url: https://example.com/webhook
+    events:
+      - guardrail_violation
+      - timeout

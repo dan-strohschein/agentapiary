@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -94,17 +95,32 @@ func (s *Store) runBackgroundTasks() {
 }
 
 // key constructs a storage key from kind, name, and namespace.
+// Optimized: Uses strings.Builder to avoid fmt.Sprintf overhead.
 func (s *Store) key(kind, name, namespace string) []byte {
-	if namespace == "" {
-		return []byte(fmt.Sprintf("/%s/%s", kind, name))
+	var b strings.Builder
+	b.Grow(len(kind) + len(name) + len(namespace) + 4) // Pre-allocate capacity
+
+	b.WriteByte('/')
+	if namespace != "" {
+		b.WriteString(namespace)
+		b.WriteByte('/')
 	}
-	return []byte(fmt.Sprintf("/%s/%s/%s", namespace, kind, name))
+	b.WriteString(kind)
+	b.WriteByte('/')
+	b.WriteString(name)
+	return []byte(b.String())
 }
 
 // versionKey constructs a versioned storage key.
+// Optimized: Uses strings.Builder to avoid fmt.Sprintf overhead.
 func (s *Store) versionKey(kind, name, namespace string, version int) []byte {
 	base := s.key(kind, name, namespace)
-	return []byte(fmt.Sprintf("%s:v%d", string(base), version))
+	var b strings.Builder
+	b.Grow(len(base) + 16) // Pre-allocate: base + ":v" + up to 10 digits + buffer
+	b.Write(base)
+	b.WriteString(":v")
+	b.WriteString(strconv.Itoa(version))
+	return []byte(b.String())
 }
 
 // Create stores a new resource.

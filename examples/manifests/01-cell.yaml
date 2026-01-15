@@ -1,0 +1,10 @@
+apiVersion: apiary.io/v1
+kind: Cell
+metadata:
+  name: default
+spec:
+  resourceQuota:
+    maxAgentSpecs: 100
+    maxHives: 50
+    maxMemoryGB: 100
+    maxCPU: 1000

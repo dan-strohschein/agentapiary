@@ -354,26 +354,76 @@ func validateAgentSpec(spec *apiary.AgentSpec) []ValidationError {
 func validateHive(hive *apiary.Hive) []ValidationError {
 	var errors []ValidationError
 
-	if hive.Spec.Pattern != "" {
+	// Check if pattern composition is used
+	if len(hive.Spec.PatternSegments) > 0 {
+		// Validate pattern segments
+		if hive.Spec.Pattern != "" {
+			errors = append(errors, ValidationError{
+				Field:   "spec.pattern",
+				Message: "spec.pattern cannot be specified when spec.patternSegments is used",
+			})
+		}
+
 		validPatterns := map[string]bool{
 			"pipeline":      true,
 			"hierarchical":  true,
 			"swarm":         true,
 			"event-driven":  true,
 		}
-		if !validPatterns[hive.Spec.Pattern] {
+
+		for i, segment := range hive.Spec.PatternSegments {
+			if segment.Name == "" {
+				errors = append(errors, ValidationError{
+					Field:   fmt.Sprintf("spec.patternSegments[%d].name", i),
+					Message: "segment name is required",
+				})
+			}
+
+			if segment.Pattern == "" {
+				errors = append(errors, ValidationError{
+					Field:   fmt.Sprintf("spec.patternSegments[%d].pattern", i),
+					Message: "segment pattern is required",
+				})
+			} else if !validPatterns[segment.Pattern] {
+				errors = append(errors, ValidationError{
+					Field:   fmt.Sprintf("spec.patternSegments[%d].pattern", i),
+					Message: fmt.Sprintf("invalid pattern: %s (must be one of: pipeline, hierarchical, swarm, event-driven)", segment.Pattern),
+				})
+			}
+
+			// Validate pattern-specific config
+			if segment.Pattern == "pipeline" {
+				if stages, ok := segment.Config["stages"].([]interface{}); !ok || len(stages) == 0 {
+					errors = append(errors, ValidationError{
+						Field:   fmt.Sprintf("spec.patternSegments[%d].config.stages", i),
+						Message: "stages are required for pipeline pattern",
+					})
+				}
+			}
+		}
+	} else {
+		// Validate single pattern (backward compatibility)
+		if hive.Spec.Pattern != "" {
+			validPatterns := map[string]bool{
+				"pipeline":      true,
+				"hierarchical":  true,
+				"swarm":         true,
+				"event-driven":  true,
+			}
+			if !validPatterns[hive.Spec.Pattern] {
+				errors = append(errors, ValidationError{
+					Field:   "spec.pattern",
+					Message: fmt.Sprintf("invalid pattern: %s (must be one of: pipeline, hierarchical, swarm, event-driven)", hive.Spec.Pattern),
+				})
+			}
+		}
+
+		if hive.Spec.Pattern == "pipeline" && len(hive.Spec.Stages) == 0 {
 			errors = append(errors, ValidationError{
-				Field:   "spec.pattern",
-				Message: fmt.Sprintf("invalid pattern: %s (must be one of: pipeline, hierarchical, swarm, event-driven)", hive.Spec.Pattern),
+				Field:   "spec.stages",
+				Message: "spec.stages is required for pipeline pattern",
 			})
 		}
-	}
-
-	if hive.Spec.Pattern == "pipeline" && len(hive.Spec.Stages) == 0 {
-		errors = append(errors, ValidationError{
-			Field:   "spec.stages",
-			Message: "spec.stages is required for pipeline pattern",
-		})
 	}
 
 	for i, stage := range hive.Spec.Stages {

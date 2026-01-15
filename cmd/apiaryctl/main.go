@@ -1,16 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/agentapiary/apiary/cmd/apiaryctl/cmd"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: apiaryctl <command> [options]\n")
+	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}
-
-	// TODO: Implement CLI commands
-	fmt.Println("apiaryctl - CLI implementation pending")
 }

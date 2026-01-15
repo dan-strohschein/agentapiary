@@ -1,0 +1,27 @@
+apiVersion: apiary.io/v1
+kind: Hive
+metadata:
+  name: swarm-hive
+  namespace: default
+  labels:
+    app: swarm
+    pattern: swarm
+spec:
+  poolMode: cold
+  pattern: swarm
+  stages:
+    - name: agent1
+      agentRef: echo-agent
+      replicas: 2
+    - name: agent2
+      agentRef: llm-agent
+      replicas: 2
+    - name: agent3
+      agentRef: echo-agent
+      replicas: 2
+  session:
+    timeoutMinutes: 60
+    maxDurationMinutes: 180
+  guardrails:
+    responseTimeoutSeconds: 45
+    rateLimitPerMinute: 80

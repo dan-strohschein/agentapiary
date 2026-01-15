@@ -7,10 +7,26 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// AuthorizationConfig holds configuration for authorization middleware.
+type AuthorizationConfig struct {
+	// RequireAuth determines if authentication is required.
+	// If true, requests without a principal will be rejected with 401 Unauthorized.
+	// If false, requests without a principal are allowed (development/testing mode).
+	// Default: true (require authentication)
+	RequireAuth bool
+}
+
 // AuthorizationMiddleware creates middleware for authorization checks.
-// For MVP: If no principal is present, allow access (no authentication required).
-// If principal is present, enforce RBAC permissions.
-func AuthorizationMiddleware(rbac *RBAC) echo.MiddlewareFunc {
+// By default, authentication is required. Requests without a principal will be rejected.
+// If RequireAuth is false, unauthenticated requests are allowed (development/testing mode).
+func AuthorizationMiddleware(rbac *RBAC, config ...AuthorizationConfig) echo.MiddlewareFunc {
+	cfg := AuthorizationConfig{
+		RequireAuth: true, // Default: require authentication
+	}
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			// Skip authorization for non-namespaced endpoints (Cells)
@@ -22,8 +38,14 @@ func AuthorizationMiddleware(rbac *RBAC) echo.MiddlewareFunc {
 			// Get principal from context
 			principal, ok := PrincipalFromContext(c.Request().Context())
 			if !ok {
-				// For MVP: If no principal, allow access (no authentication required)
-				// In production, you'd want to require authentication
+				// Authentication required by default
+				if cfg.RequireAuth {
+					return c.JSON(http.StatusUnauthorized, map[string]string{
+						"error":   "unauthorized",
+						"message": "Authentication required",
+					})
+				}
+				// Development/testing mode: allow unauthenticated access
 				return next(c)
 			}
 
@@ -57,9 +79,19 @@ func AuthorizationMiddleware(rbac *RBAC) echo.MiddlewareFunc {
 }
 
 // ExtractPrincipalFromHeader extracts principal from HTTP headers (simple MVP approach).
-// In production, this would use proper authentication (JWT, API keys, etc.)
+//
+// SECURITY WARNING: This is an unauthenticated, header-based approach that trusts
+// user-provided headers without verification. This MUST NOT be used in production.
+//
+// In production, implement proper authentication:
+//   - JWT validation with signature verification
+//   - API keys with HMAC validation
+//   - OAuth2/OIDC integration
+//   - At minimum, add request signing/HMAC verification
+//
+// This MVP implementation should be removed before any production deployment.
 func ExtractPrincipalFromHeader(c echo.Context) *Principal {
-	// For MVP, use X-User-ID header
+	// For MVP, use X-User-ID header (UNVERIFIED - DO NOT USE IN PRODUCTION)
 	userID := c.Request().Header.Get("X-User-ID")
 	if userID == "" {
 		return nil

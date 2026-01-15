@@ -65,21 +65,26 @@ func (k *Keeper) StartMessageRelay(ctx context.Context, bus nectar.MessageBus, a
 		return fmt.Errorf("message bus is required")
 	}
 
+	// Create cancelable context for message relay goroutines
+	relayCtx, cancel := context.WithCancel(ctx)
+
 	k.mu.Lock()
 	k.messageBus = bus
 	k.agentID = agentID
 	k.inboundQueue = newMessageQueue(1000)  // Buffer up to 1000 inbound messages
 	k.outboundQueue = newMessageQueue(1000) // Buffer up to 1000 outbound messages
+	k.relayCancel = cancel // Store cancel function for cleanup
 	k.mu.Unlock()
 
 	// Subscribe to agent's inbound topic (prefixed with Cell/namespace)
 	namespace := k.spec.GetNamespace()
 	baseTopic := fmt.Sprintf("agent.%s.inbound", agentID)
 	topic := nectar.PrefixTopic(namespace, baseTopic)
-	sub, err := bus.Subscribe(ctx, topic, func(ctx context.Context, busMsg *nectar.Message) error {
+	sub, err := bus.Subscribe(relayCtx, topic, func(ctx context.Context, busMsg *nectar.Message) error {
 		return k.handleInboundMessage(ctx, busMsg)
 	})
 	if err != nil {
+		cancel() // Clean up context on error
 		return fmt.Errorf("failed to subscribe to inbound topic: %w", err)
 	}
 
@@ -88,14 +93,26 @@ func (k *Keeper) StartMessageRelay(ctx context.Context, bus nectar.MessageBus, a
 	k.mu.Unlock()
 
 	// Start message delivery goroutine (bus -> agent)
-	go k.deliverMessages(ctx)
+	k.relayWg.Add(1)
+	go func() {
+		defer k.relayWg.Done()
+		k.deliverMessages(relayCtx)
+	}()
 
 	// Start message publishing goroutine (agent -> bus)
-	go k.publishMessages(ctx)
+	k.relayWg.Add(1)
+	go func() {
+		defer k.relayWg.Done()
+		k.publishMessages(relayCtx)
+	}()
 
 	// Start reading from agent stdout (if stdin interface)
 	if k.spec.Spec.Interface.Type == "stdin" {
-		go k.readAgentOutput(ctx)
+		k.relayWg.Add(1)
+		go func() {
+			defer k.relayWg.Done()
+			k.readAgentOutput(relayCtx)
+		}()
 	}
 
 	k.logger.Info("Message relay started",
@@ -122,6 +139,34 @@ func (k *Keeper) handleInboundMessage(ctx context.Context, busMsg *nectar.Messag
 					k.agentID,
 				)
 			}
+			// Audit log guardrail violation
+			if k.auditLogger != nil && k.spec != nil {
+				sessionID := busMsg.SessionID
+				if sessionID == "" {
+					sessionID = k.sessionID // Fallback to Keeper's session ID
+				}
+				hiveName, _ := k.getHiveNameFromSession(ctx, sessionID)
+				rateLimitErr := &guardrails.RateLimitExceededError{
+					RequestsPerMinute: k.rateLimiter.RequestsPerMinute(),
+				}
+				k.auditLogger.LogGuardrailViolation(
+					"rate_limit",
+					k.spec.GetNamespace(),
+					hiveName,
+					k.spec.GetName(),
+					k.agentID,
+					sessionID,
+					busMsg.ID,
+					rateLimitErr.Error(),
+					map[string]interface{}{
+						"requestsPerMinute": k.rateLimiter.RequestsPerMinute(),
+					},
+				)
+			}
+			// Fire webhook for rate limit violation
+			k.fireWebhook(ctx, "rate_limit", busMsg.ID, &guardrails.RateLimitExceededError{
+				RequestsPerMinute: k.rateLimiter.RequestsPerMinute(),
+			})
 			return &guardrails.RateLimitExceededError{
 				RequestsPerMinute: k.rateLimiter.RequestsPerMinute(),
 			}
@@ -140,6 +185,27 @@ func (k *Keeper) handleInboundMessage(ctx context.Context, busMsg *nectar.Messag
 
 	// Set destination agent ID
 	waggleMsg.DestAgentID = k.agentID
+
+	// Audit log agent input
+	if k.auditLogger != nil && k.spec != nil {
+		details := map[string]interface{}{
+			"messageType": string(waggleMsg.Type),
+			"sourceAgentID": waggleMsg.SourceAgentID,
+			"correlationID": waggleMsg.CorrelationID,
+		}
+		// Include payload size (not full payload for security/performance)
+		if len(waggleMsg.Payload) > 0 {
+			details["payloadSize"] = len(waggleMsg.Payload)
+		}
+		k.auditLogger.LogAgentInput(
+			k.spec.GetNamespace(),
+			k.spec.GetName(),
+			k.agentID,
+			waggleMsg.SessionID,
+			waggleMsg.ID,
+			details,
+		)
+	}
 
 	// Queue for delivery to agent
 	if err := k.inboundQueue.enqueue(waggleMsg); err != nil {
@@ -321,6 +387,25 @@ func (k *Keeper) publishMessageWithRetry(ctx context.Context, queuedMsg *queuedM
 						k.agentID,
 					)
 				}
+				// Audit log guardrail violation
+				if k.auditLogger != nil && k.spec != nil {
+					hiveName, _ := k.getHiveNameFromSession(ctx, k.sessionID)
+					k.auditLogger.LogGuardrailViolation(
+						"output_validation",
+						k.spec.GetNamespace(),
+						hiveName,
+						k.spec.GetName(),
+						k.agentID,
+						queuedMsg.msg.SessionID,
+						queuedMsg.msg.ID,
+						err.Error(),
+						map[string]interface{}{
+							"payloadSize": len(queuedMsg.msg.Payload),
+						},
+					)
+				}
+				// Fire webhook for output validation failure
+				k.fireWebhook(ctx, "output_validation", queuedMsg.msg.ID, err)
 				// Validation failed - return error to prevent publishing
 				return fmt.Errorf("output validation failed: %w", err)
 			}
@@ -335,6 +420,25 @@ func (k *Keeper) publishMessageWithRetry(ctx context.Context, queuedMsg *queuedM
 						zap.String("msgID", queuedMsg.msg.ID),
 						zap.Error(err),
 					)
+					// Audit log guardrail violation
+					if k.auditLogger != nil && k.spec != nil {
+						hiveName, _ := k.getHiveNameFromSession(ctx, k.sessionID)
+						k.auditLogger.LogGuardrailViolation(
+							"token_budget",
+							k.spec.GetNamespace(),
+							hiveName,
+							k.spec.GetName(),
+							k.agentID,
+							queuedMsg.msg.SessionID,
+							queuedMsg.msg.ID,
+							err.Error(),
+							map[string]interface{}{
+								"tokenCount": tokenCount,
+							},
+						)
+					}
+					// Fire webhook for token budget violation
+					k.fireWebhook(ctx, "token_budget", queuedMsg.msg.ID, err)
 					// Budget exceeded - return error to prevent publishing
 					// TODO: Report to Queen and terminate agent if needed
 					return err
@@ -356,6 +460,31 @@ func (k *Keeper) publishMessageWithRetry(ctx context.Context, queuedMsg *queuedM
 		// Publish
 		err = k.messageBus.Publish(ctx, topic, busMsg)
 		if err == nil {
+			// Audit log agent output
+			if k.auditLogger != nil && k.spec != nil {
+				details := map[string]interface{}{
+					"messageType": string(queuedMsg.msg.Type),
+					"topic": topic,
+					"correlationID": queuedMsg.msg.CorrelationID,
+				}
+				// Include payload size (not full payload for security/performance)
+				if len(queuedMsg.msg.Payload) > 0 {
+					details["payloadSize"] = len(queuedMsg.msg.Payload)
+				}
+				// Include token count if available
+				if tokenCount := guardrails.ExtractTokenCount(queuedMsg.msg.Metadata); tokenCount > 0 {
+					details["tokenCount"] = tokenCount
+				}
+				k.auditLogger.LogAgentOutput(
+					k.spec.GetNamespace(),
+					k.spec.GetName(),
+					k.agentID,
+					queuedMsg.msg.SessionID,
+					queuedMsg.msg.ID,
+					details,
+				)
+			}
+
 			// Success - complete tracking for this response
 			// Try to match by correlation ID first, then by message ID
 			if k.timeoutTracker != nil {
@@ -437,7 +566,9 @@ func (k *Keeper) readAgentOutput(ctx context.Context) {
 	// 1. Reading from process.Stdout
 	// 2. Parsing Waggle messages (newline-delimited JSON)
 	// 3. Queueing for publishing to bus
-	k.logger.Debug("Agent output reading not yet fully implemented")
+	
+	// For now, wait for context cancellation to ensure proper cleanup
+	<-ctx.Done()
 }
 
 // PublishAgentMessage queues a message from the agent to be published to the bus.

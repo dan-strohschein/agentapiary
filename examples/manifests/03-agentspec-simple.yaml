@@ -1,0 +1,36 @@
+apiVersion: apiary.io/v1
+kind: AgentSpec
+metadata:
+  name: echo-agent
+  namespace: default
+  labels:
+    app: echo
+    tier: simple
+spec:
+  runtime:
+    command:
+      - /bin/sh
+      - -c
+      - "while IFS= read -r line; do echo \"Echo: $line\"; done"
+    env:
+      - name: ENV_VAR
+        value: "example"
+  interface:
+    type: stdin
+  resources:
+    requests:
+      cpu: 100      # 100 millicores (0.1 CPU)
+      memory: 128000000  # 128 MB
+    limits:
+      cpu: 500      # 500 millicores (0.5 CPU)
+      memory: 256000000  # 256 MB
+  taskTier: simple
+  scaling:
+    minReplicas: 1
+    maxReplicas: 10
+    targetLatencyMs: 100
+    cooldownSeconds: 60
+  guardrails:
+    responseTimeoutSeconds: 30
+    rateLimitPerMinute: 60
+    tokenBudgetPerRequest: 10000

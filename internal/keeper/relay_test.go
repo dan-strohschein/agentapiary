@@ -37,7 +37,7 @@ func setupTestKeeperWithBus(t *testing.T) (*Keeper, nectar.MessageBus, func()) {
 		},
 	}
 
-	keeper := NewKeeper(spec, logger, nil, combStore, "test-session")
+	keeper := NewKeeper(spec, logger, nil, combStore, "test-session", nil)
 
 	bus, err := nectar.NewBus(nectar.Config{
 		Logger:     logger,

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agentapiary/apiary/internal/audit"
 	"github.com/agentapiary/apiary/internal/autoscaler"
 	"github.com/agentapiary/apiary/internal/circuitbreaker"
 	"github.com/agentapiary/apiary/internal/warmpool"
@@ -22,6 +23,7 @@ type Queen struct {
 	autoscaler    *autoscaler.Autoscaler
 	warmPool      *warmpool.Manager
 	logger        *zap.Logger
+	auditLogger   *audit.Logger // Audit logger for structured logging
 	droneReg      *droneRegistry
 	circuitBreaker *circuitbreaker.Manager
 	reconcileCh   chan struct{}
@@ -38,6 +40,14 @@ type Config struct {
 	Autoscaler *autoscaler.Autoscaler
 	WarmPool   *warmpool.Manager
 	Logger     *zap.Logger
+	// EtcdEndpoints is a comma-separated list of etcd endpoints for leader election.
+	// If empty, leader election is disabled (single-instance mode).
+	// Example: "http://etcd1:2379,http://etcd2:2379,http://etcd3:2379"
+	EtcdEndpoints string
+	// LeaderKey is the etcd key used for leader election. Defaults to "/apiary/leader" if empty.
+	LeaderKey string
+	// LeaderLeaseTTL is the TTL for the leader lease in seconds. Defaults to 30 if zero.
+	LeaderLeaseTTL int
 }
 
 // NewQueen creates a new Queen orchestrator.
@@ -49,6 +59,7 @@ func NewQueen(cfg Config) *Queen {
 		autoscaler:     cfg.Autoscaler,
 		warmPool:       cfg.WarmPool,
 		logger:         cfg.Logger,
+		auditLogger:    audit.NewLogger(cfg.Logger), // Initialize audit logger
 		droneReg:       newDroneRegistry(),
 		circuitBreaker: circuitbreaker.NewManager(circuitbreaker.Config{}),
 		reconcileCh:    make(chan struct{}, 1),
@@ -350,6 +361,18 @@ func (q *Queen) reconcileAgentSpec(ctx context.Context, spec *apiary.AgentSpec) 
 	// Create Drones if needed
 	if currentReplicas < desiredReplicas {
 		toCreate := desiredReplicas - currentReplicas
+		// Audit log scaling up
+		if q.auditLogger != nil {
+			q.auditLogger.LogScalingUp(
+				spec.GetNamespace(),
+				spec.GetName(),
+				currentReplicas,
+				desiredReplicas,
+				map[string]interface{}{
+					"reason": "reconciliation",
+				},
+			)
+		}
 		for i := 0; i < toCreate; i++ {
 			if err := q.createDrone(ctx, spec); err != nil {
 				q.logger.Error("Failed to create drone", zap.Error(err))
@@ -361,6 +384,18 @@ func (q *Queen) reconcileAgentSpec(ctx context.Context, spec *apiary.AgentSpec) 
 	// Delete excess Drones
 	if currentReplicas > desiredReplicas {
 		toDelete := currentReplicas - desiredReplicas
+		// Audit log scaling down
+		if q.auditLogger != nil {
+			q.auditLogger.LogScalingDown(
+				spec.GetNamespace(),
+				spec.GetName(),
+				currentReplicas,
+				desiredReplicas,
+				map[string]interface{}{
+					"reason": "reconciliation",
+				},
+			)
+		}
 		for i := 0; i < toDelete && i < len(drones); i++ {
 			drone, ok := drones[i].(*apiary.Drone)
 			if !ok {
@@ -449,6 +484,19 @@ func (q *Queen) createDrone(ctx context.Context, spec *apiary.AgentSpec) error {
 	// Register in drone registry
 	q.droneReg.add(drone.GetUID(), process)
 
+	// Audit log resource creation
+	if q.auditLogger != nil {
+		q.auditLogger.LogResourceCreate(
+			"Drone",
+			drone.GetName(),
+			drone.GetNamespace(),
+			map[string]interface{}{
+				"agentSpec": spec.GetName(),
+				"uid":       drone.GetUID(),
+			},
+		)
+	}
+
 	q.logger.Info("Created drone",
 		zap.String("name", drone.GetName()),
 		zap.String("agentspec", spec.GetName()),
@@ -473,6 +521,19 @@ func (q *Queen) deleteDrone(ctx context.Context, drone *apiary.Drone) error {
 	// Delete from store
 	if err := q.store.Delete(ctx, "Drone", drone.GetName(), drone.GetNamespace()); err != nil {
 		return fmt.Errorf("failed to delete drone: %w", err)
+	}
+
+	// Audit log resource deletion
+	if q.auditLogger != nil {
+		q.auditLogger.LogResourceDelete(
+			"Drone",
+			drone.GetName(),
+			drone.GetNamespace(),
+			map[string]interface{}{
+				"agentSpec": drone.Spec.GetName(),
+				"uid":       drone.GetUID(),
+			},
+		)
 	}
 
 	q.logger.Info("Deleted drone", zap.String("name", drone.GetName()))

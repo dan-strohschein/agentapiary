@@ -1,0 +1,30 @@
+apiVersion: apiary.io/v1
+kind: Hive
+metadata:
+  name: hierarchical-hive
+  namespace: default
+  labels:
+    app: hierarchical
+    pattern: hierarchical
+spec:
+  poolMode: hybrid
+  warmPoolSize: 1
+  pattern: hierarchical
+  stages:
+    - name: supervisor
+      agentRef: llm-agent
+      replicas: 1
+    - name: worker1
+      agentRef: echo-agent
+      replicas: 3
+    - name: worker2
+      agentRef: echo-agent
+      replicas: 3
+  routing:
+    retryPolicy:
+      maxRetries: 2
+      initialDelaySeconds: 2
+      maxDelaySeconds: 30
+  guardrails:
+    responseTimeoutSeconds: 60
+    rateLimitPerMinute: 50

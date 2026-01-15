@@ -1,0 +1,705 @@
+syntax = "proto3";
+
+package apiary.v1;
+
+option go_package = "github.com/agentapiary/apiary/api/proto/v1;v1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ============================================================================
+// Foundational Types (8.1a.1)
+// ============================================================================
+
+// TypeMeta contains type information for resources.
+message TypeMeta {
+  string api_version = 1;
+  string kind = 2;
+}
+
+// ObjectMeta contains metadata common to all resources.
+message ObjectMeta {
+  string name = 1;
+  string namespace = 2;  // optional
+  string uid = 3;        // optional
+  map<string, string> labels = 4;       // optional
+  map<string, string> annotations = 5;  // optional
+  google.protobuf.Timestamp created_at = 6;  // optional
+  google.protobuf.Timestamp updated_at = 7;  // optional
+}
+
+// ResourceRequirements specifies resource requirements for a Drone.
+message ResourceRequirements {
+  int64 cpu = 1;     // in millicores
+  int64 memory = 2;  // in bytes
+}
+
+// HealthStatus represents the health of a component.
+message HealthStatus {
+  bool healthy = 1;
+  string message = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  map<string, string> details = 4;  // optional - simplified from map[string]interface{}
+}
+
+// ============================================================================
+// Supporting Types - Phases and Enums (8.1a.2)
+// ============================================================================
+
+// DronePhase indicates the phase of a Drone's lifecycle.
+enum DronePhase {
+  DRONE_PHASE_UNSPECIFIED = 0;
+  DRONE_PHASE_PENDING = 1;
+  DRONE_PHASE_STARTING = 2;
+  DRONE_PHASE_RUNNING = 3;
+  DRONE_PHASE_STOPPING = 4;
+  DRONE_PHASE_STOPPED = 5;
+  DRONE_PHASE_FAILED = 6;
+}
+
+// HivePhase indicates the phase of a Hive's lifecycle.
+enum HivePhase {
+  HIVE_PHASE_UNSPECIFIED = 0;
+  HIVE_PHASE_PENDING = 1;
+  HIVE_PHASE_ACTIVE = 2;
+  HIVE_PHASE_PAUSED = 3;
+  HIVE_PHASE_FAILED = 4;
+}
+
+// SessionPhase indicates the phase of a Session's lifecycle.
+enum SessionPhase {
+  SESSION_PHASE_UNSPECIFIED = 0;
+  SESSION_PHASE_CREATED = 1;
+  SESSION_PHASE_ACTIVE = 2;
+  SESSION_PHASE_IDLE = 3;
+  SESSION_PHASE_TERMINATED = 4;
+}
+
+// ============================================================================
+// Supporting Types - Configs (8.1a.2)
+// ============================================================================
+
+// SecretKeySelector selects a key from a secret.
+message SecretKeySelector {
+  string name = 1;
+  string key = 2;
+}
+
+// EnvVarSource represents a source for an environment variable.
+message EnvVarSource {
+  SecretKeySelector secret_key_ref = 1;  // optional
+}
+
+// EnvVar represents an environment variable.
+message EnvVar {
+  string name = 1;
+  string value = 2;  // optional
+  EnvVarSource value_from = 3;  // optional
+}
+
+// RuntimeConfig specifies how to run the agent.
+message RuntimeConfig {
+  repeated string command = 1;
+  string working_dir = 2;  // optional
+  repeated EnvVar env = 3;  // optional
+}
+
+// InterfaceConfig specifies how the Keeper communicates with the agent.
+message InterfaceConfig {
+  string type = 1;  // stdin, http, grpc, unix-socket
+  int32 port = 2;  // optional
+  string health_path = 3;  // optional
+  string message_path = 4;  // optional
+}
+
+// ResourceConfig specifies resource requirements and limits.
+message ResourceConfig {
+  ResourceRequirements requests = 1;
+  ResourceRequirements limits = 2;
+  int64 token_budget_per_request = 3;  // optional
+}
+
+// ScalingConfig defines autoscaling behavior.
+message ScalingConfig {
+  int32 min_replicas = 1;
+  int32 max_replicas = 2;
+  int32 target_latency_ms = 3;  // optional
+  double scale_up_threshold = 4;  // optional
+  double scale_down_threshold = 5;  // optional
+  int32 cooldown_seconds = 6;  // optional
+}
+
+// GuardrailConfig defines safety guardrails.
+message GuardrailConfig {
+  int32 response_timeout_seconds = 1;  // optional
+  int32 rate_limit_per_minute = 2;  // optional
+  string output_schema = 3;  // optional - JSON schema as string (simplified from map[string]interface{})
+  int64 token_budget_per_request = 4;  // optional
+  int64 token_budget_per_session = 5;  // optional
+  int64 token_budget_per_minute = 6;  // optional
+}
+
+// RetryPolicy defines retry behavior.
+message RetryPolicy {
+  int32 max_retries = 1;
+  int32 backoff_multiplier = 2;
+  int32 initial_delay_ms = 3;
+}
+
+// RoutingConfig defines message routing configuration.
+message RoutingConfig {
+  string dead_letter_topic = 1;  // optional
+  RetryPolicy retry_policy = 2;  // optional
+}
+
+// WebhookConfig defines webhook configuration for guardrail violations.
+message WebhookConfig {
+  string url = 1;  // optional
+  string auth_header = 2;  // optional
+}
+
+// SessionConfig defines session configuration.
+message SessionConfig {
+  int32 timeout_minutes = 1;  // optional
+  int32 max_duration_minutes = 2;  // optional
+  bool persist_on_terminate = 3;  // optional
+  string persist_path = 4;  // optional
+  int32 max_memory_mb = 5;  // optional
+}
+
+// Stage represents a stage in a pipeline pattern.
+message Stage {
+  string name = 1;
+  string agent_ref = 2;
+  int32 replicas = 3;
+  bool parallel = 4;  // optional
+  bool wait_for_all = 5;  // optional
+}
+
+// ResourceQuota defines resource limits for a Cell.
+message ResourceQuota {
+  int32 max_hives = 1;  // optional
+  int32 max_drones_per_hive = 2;  // optional
+  int32 max_total_drones = 3;  // optional
+  int32 max_memory_gb = 4;  // optional
+}
+
+// DefaultConfig defines default values for resources in a Cell.
+message DefaultConfig {
+  GuardrailConfig guardrails = 1;  // optional
+}
+
+// ============================================================================
+// Supporting Types - Statuses (8.1a.2)
+// ============================================================================
+
+// DroneStatus represents the current status of a Drone.
+message DroneStatus {
+  DronePhase phase = 1;
+  string message = 2;  // optional
+  google.protobuf.Timestamp started_at = 3;  // optional
+  string keeper_addr = 4;  // optional
+  HealthStatus health = 5;  // optional
+}
+
+// HiveStatus represents the current status of a Hive.
+message HiveStatus {
+  HivePhase phase = 1;
+  string message = 2;  // optional
+  int32 active_drones = 3;  // optional
+}
+
+// SessionStatus represents the current status of a Session.
+message SessionStatus {
+  SessionPhase phase = 1;
+  google.protobuf.Timestamp last_activity = 2;
+  int32 active_agents = 3;  // optional
+}
+
+// ============================================================================
+// Core Resource Types - Specs (8.1a.2)
+// ============================================================================
+
+// AgentSpecSpec contains the agent specification details.
+message AgentSpecSpec {
+  RuntimeConfig runtime = 1;
+  InterfaceConfig interface = 2;
+  ResourceConfig resources = 3;
+  ScalingConfig scaling = 4;  // optional
+  string task_tier = 5;  // optional
+  GuardrailConfig guardrails = 6;  // optional
+}
+
+// HiveSpec defines the Hive specification.
+message HiveSpec {
+  string pool_mode = 1;  // optional - cold, warm, hybrid
+  int32 warm_pool_size = 2;  // optional
+  SessionConfig session = 3;  // optional
+  string pattern = 4;  // optional - pipeline, hierarchical, swarm, event-driven
+  repeated Stage stages = 5;  // optional
+  RoutingConfig routing = 6;  // optional
+  GuardrailConfig guardrails = 7;  // optional
+  WebhookConfig webhook = 8;  // optional
+}
+
+// CellSpec defines the Cell specification.
+message CellSpec {
+  ResourceQuota resource_quota = 1;  // optional
+  DefaultConfig defaults = 2;  // optional
+}
+
+// ============================================================================
+// Core Resource Types - Resources (8.1a.2)
+// ============================================================================
+
+// Cell represents a namespace for resource isolation.
+message Cell {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  CellSpec spec = 3;
+}
+
+// AgentSpec defines the specification for an agent.
+message AgentSpec {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  AgentSpecSpec spec = 3;
+}
+
+// Hive represents a collection of agents working together.
+message Hive {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  HiveSpec spec = 3;
+  HiveStatus status = 4;  // optional
+}
+
+// Secret represents a secret containing sensitive data.
+message Secret {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  map<string, bytes> data = 3;  // data is map[string][]byte in Go, bytes in protobuf
+}
+
+// Drone represents a running instance of an agent.
+message Drone {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  DroneStatus status = 3;
+  AgentSpec spec = 4;  // optional - AgentSpec reference
+}
+
+// Session represents an execution context with shared memory.
+message Session {
+  TypeMeta type_meta = 1;
+  ObjectMeta metadata = 2;
+  SessionStatus status = 3;
+  SessionConfig spec = 4;
+}
+
+// ============================================================================
+// API-Specific Types - Metrics, Quota, RBAC, DLQ (8.1a.4)
+// ============================================================================
+
+// QuotaUsage represents current quota usage for a Cell.
+message QuotaUsage {
+  int32 hives = 1;
+  int32 total_drones = 2;
+  int64 memory_used_gb = 3;
+  int32 memory_limit_gb = 4;
+}
+
+// Role represents a user role.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_DEVELOPER = 2;
+  ROLE_VIEWER = 3;
+}
+
+// Permission represents an action that can be performed on a resource.
+enum Permission {
+  PERMISSION_UNSPECIFIED = 0;
+  PERMISSION_CREATE = 1;
+  PERMISSION_READ = 2;
+  PERMISSION_UPDATE = 3;
+  PERMISSION_DELETE = 4;
+}
+
+// Principal represents an authenticated user/entity.
+message Principal {
+  string id = 1;
+  string name = 2;
+}
+
+// CellRoles represents role assignments for a Cell (map<string, Role>).
+message CellRoles {
+  map<string, Role> roles = 1;
+}
+
+// LatencyStats holds latency statistics.
+message LatencyStats {
+  int64 p50_ms = 1;  // P50 latency in milliseconds
+  int64 p95_ms = 2;  // P95 latency in milliseconds
+  int64 p99_ms = 3;  // P99 latency in milliseconds
+  int64 count = 4;
+}
+
+// AgentSpecMetrics represents metrics for an AgentSpec.
+message AgentSpecMetrics {
+  string namespace = 1;
+  string agentspec = 2;
+  LatencyStats latency = 3;  // optional
+  int64 token_usage = 4;  // optional
+  int32 queue_depth = 5;  // optional
+  double request_rate = 6;  // optional
+}
+
+// NamespaceMetrics represents metrics for a namespace.
+message NamespaceMetrics {
+  string namespace = 1;
+  map<string, AgentSpecMetrics> metrics = 2;  // key: agentspec name
+}
+
+// NectarMessage represents a message from the nectar message bus (simplified).
+message NectarMessage {
+  string id = 1;
+  string type = 2;
+  bytes payload = 3;
+  map<string, string> metadata = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  string source = 6;
+  string session_id = 7;
+}
+
+// DLQMessage represents a message in the dead letter queue.
+message DLQMessage {
+  string id = 1;
+  NectarMessage original_msg = 2;
+  string failure_reason = 3;
+  google.protobuf.Timestamp failure_time = 4;
+  int32 attempts = 5;
+  map<string, string> metadata = 6;  // optional
+}
+
+// WebhookEvent represents a webhook event for guardrail violations.
+message WebhookEvent {
+  string type = 1;  // e.g., "rate_limit", "token_budget", "timeout", "output_validation", "circuit_breaker"
+  google.protobuf.Timestamp timestamp = 2;
+  string namespace = 3;
+  string hive_name = 4;  // optional
+  string agentspec = 5;  // optional
+  string drone_id = 6;  // optional
+  string session_id = 7;  // optional
+  string message_id = 8;  // optional
+  string error = 9;  // optional
+  map<string, string> details = 10;  // optional - simplified from map[string]interface{}
+}
+
+// ============================================================================
+// Request/Response Types for RPC Methods (8.1b)
+// ============================================================================
+
+// ============================================================================
+// Cells RPC Methods - Request/Response Types (8.1b.1)
+// ============================================================================
+
+// ListCellsRequest is empty (no parameters)
+message ListCellsResponse {
+  repeated Cell cells = 1;
+}
+
+// GetCellRequest requests a Cell by name.
+message GetCellRequest {
+  string name = 1;
+}
+
+// CreateCellRequest creates a new Cell.
+message CreateCellRequest {
+  Cell cell = 1;
+}
+
+// UpdateCellRequest updates an existing Cell.
+message UpdateCellRequest {
+  string name = 1;
+  Cell cell = 2;
+}
+
+// DeleteCellRequest deletes a Cell by name.
+message DeleteCellRequest {
+  string name = 1;
+}
+
+// ============================================================================
+// AgentSpecs RPC Methods - Request/Response Types (8.1b.2)
+// ============================================================================
+
+// ListAgentSpecsRequest lists AgentSpecs in a namespace.
+message ListAgentSpecsRequest {
+  string namespace = 1;
+}
+
+// ListAgentSpecsResponse returns a list of AgentSpecs.
+message ListAgentSpecsResponse {
+  repeated AgentSpec agentspecs = 1;
+}
+
+// GetAgentSpecRequest requests an AgentSpec by name.
+message GetAgentSpecRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// CreateAgentSpecRequest creates a new AgentSpec.
+message CreateAgentSpecRequest {
+  string namespace = 1;
+  AgentSpec agentspec = 2;
+}
+
+// UpdateAgentSpecRequest updates an existing AgentSpec.
+message UpdateAgentSpecRequest {
+  string namespace = 1;
+  string name = 2;
+  AgentSpec agentspec = 3;
+}
+
+// DeleteAgentSpecRequest deletes an AgentSpec by name.
+message DeleteAgentSpecRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// ScaleAgentSpecRequest scales an AgentSpec.
+message ScaleAgentSpecRequest {
+  string namespace = 1;
+  string name = 2;
+  int32 replicas = 3;
+}
+
+// ScaleAgentSpecResponse returns the scale operation result.
+message ScaleAgentSpecResponse {
+  string message = 1;
+  int32 replicas = 2;
+}
+
+// DrainAgentSpecRequest drains an AgentSpec.
+message DrainAgentSpecRequest {
+  string namespace = 1;
+  string name = 2;
+  bool force = 3;  // optional
+  string timeout = 4;  // optional - duration string like "30s"
+}
+
+// DrainAgentSpecResponse returns the drain operation result.
+message DrainAgentSpecResponse {
+  string message = 1;
+  int32 drained_count = 2;
+  repeated string errors = 3;  // optional
+}
+
+// ============================================================================
+// Hives RPC Methods - Request/Response Types (8.1b.3)
+// ============================================================================
+
+// ListHivesRequest lists Hives in a namespace.
+message ListHivesRequest {
+  string namespace = 1;
+}
+
+// ListHivesResponse returns a list of Hives.
+message ListHivesResponse {
+  repeated Hive hives = 1;
+}
+
+// GetHiveRequest requests a Hive by name.
+message GetHiveRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// CreateHiveRequest creates a new Hive.
+message CreateHiveRequest {
+  string namespace = 1;
+  Hive hive = 2;
+}
+
+// UpdateHiveRequest updates an existing Hive.
+message UpdateHiveRequest {
+  string namespace = 1;
+  string name = 2;
+  Hive hive = 3;
+}
+
+// DeleteHiveRequest deletes a Hive by name.
+message DeleteHiveRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// ScaleHiveRequest scales a Hive.
+message ScaleHiveRequest {
+  string namespace = 1;
+  string name = 2;
+  string stage = 3;  // optional - scale specific stage
+  int32 replicas = 4;
+}
+
+// ScaleHiveResponse returns the scale operation result.
+message ScaleHiveResponse {
+  string message = 1;
+  int32 replicas = 2;
+}
+
+// ============================================================================
+// Secrets RPC Methods - Request/Response Types (8.1b.4)
+// ============================================================================
+
+// ListSecretsRequest lists Secrets in a namespace.
+message ListSecretsRequest {
+  string namespace = 1;
+}
+
+// ListSecretsResponse returns a list of Secrets.
+message ListSecretsResponse {
+  repeated Secret secrets = 1;
+}
+
+// GetSecretRequest requests a Secret by name.
+message GetSecretRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// CreateSecretRequest creates a new Secret.
+message CreateSecretRequest {
+  string namespace = 1;
+  Secret secret = 2;
+}
+
+// UpdateSecretRequest updates an existing Secret.
+message UpdateSecretRequest {
+  string namespace = 1;
+  string name = 2;
+  Secret secret = 3;
+}
+
+// DeleteSecretRequest deletes a Secret by name.
+message DeleteSecretRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+// ============================================================================
+// Drones RPC Methods - Request/Response Types (8.1b.5)
+// ============================================================================
+
+// ListDronesRequest lists Drones in a namespace.
+message ListDronesRequest {
+  string namespace = 1;
+}
+
+// ListDronesResponse returns a list of Drones.
+message ListDronesResponse {
+  repeated Drone drones = 1;
+}
+
+// GetDroneRequest requests a Drone by ID.
+message GetDroneRequest {
+  string namespace = 1;
+  string id = 2;
+}
+
+// DeleteDroneRequest deletes a Drone by ID.
+message DeleteDroneRequest {
+  string namespace = 1;
+  string id = 2;
+}
+
+// GetDroneLogsRequest requests logs from a Drone.
+message GetDroneLogsRequest {
+  string namespace = 1;
+  string id = 2;
+  string tail = 3;  // optional
+  string since = 4;  // optional
+  bool follow = 5;  // optional
+}
+
+// GetDroneLogsResponse returns logs from a Drone (streaming response - bytes).
+message GetDroneLogsResponse {
+  bytes logs = 1;
+}
+
+// ExecDroneRequest executes a command in a Drone.
+message ExecDroneRequest {
+  string namespace = 1;
+  string id = 2;
+  repeated string command = 3;
+  bool stdin = 4;  // optional
+  bool tty = 5;  // optional
+  bytes stdin_data = 6;  // optional - for stdin input
+}
+
+// ExecDroneResponse returns command execution output (streaming response).
+message ExecDroneResponse {
+  bytes stdout = 1;
+  bytes stderr = 2;
+  int32 exit_code = 3;  // optional
+}
+
+// DrainDroneRequest drains a Drone.
+message DrainDroneRequest {
+  string namespace = 1;
+  string id = 2;
+  bool force = 3;  // optional
+  string timeout = 4;  // optional - duration string like "30s"
+}
+
+// DrainDroneResponse returns the drain operation result.
+message DrainDroneResponse {
+  string message = 1;
+}
+
+// ============================================================================
+// ApiaryService - gRPC Service Definition (8.1a.5, 8.1b)
+// ============================================================================
+
+service ApiaryService {
+  // Cells
+  rpc ListCells(google.protobuf.Empty) returns (ListCellsResponse);
+  rpc GetCell(GetCellRequest) returns (Cell);
+  rpc CreateCell(CreateCellRequest) returns (Cell);
+  rpc UpdateCell(UpdateCellRequest) returns (Cell);
+  rpc DeleteCell(DeleteCellRequest) returns (google.protobuf.Empty);
+
+  // AgentSpecs
+  rpc ListAgentSpecs(ListAgentSpecsRequest) returns (ListAgentSpecsResponse);
+  rpc GetAgentSpec(GetAgentSpecRequest) returns (AgentSpec);
+  rpc CreateAgentSpec(CreateAgentSpecRequest) returns (AgentSpec);
+  rpc UpdateAgentSpec(UpdateAgentSpecRequest) returns (AgentSpec);
+  rpc DeleteAgentSpec(DeleteAgentSpecRequest) returns (google.protobuf.Empty);
+  rpc ScaleAgentSpec(ScaleAgentSpecRequest) returns (ScaleAgentSpecResponse);
+  rpc DrainAgentSpec(DrainAgentSpecRequest) returns (DrainAgentSpecResponse);
+
+  // Hives
+  rpc ListHives(ListHivesRequest) returns (ListHivesResponse);
+  rpc GetHive(GetHiveRequest) returns (Hive);
+  rpc CreateHive(CreateHiveRequest) returns (Hive);
+  rpc UpdateHive(UpdateHiveRequest) returns (Hive);
+  rpc DeleteHive(DeleteHiveRequest) returns (google.protobuf.Empty);
+  rpc ScaleHive(ScaleHiveRequest) returns (ScaleHiveResponse);
+
+  // Secrets
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
+  rpc GetSecret(GetSecretRequest) returns (Secret);
+  rpc CreateSecret(CreateSecretRequest) returns (Secret);
+  rpc UpdateSecret(UpdateSecretRequest) returns (Secret);
+  rpc DeleteSecret(DeleteSecretRequest) returns (google.protobuf.Empty);
+
+  // Drones
+  rpc ListDrones(ListDronesRequest) returns (ListDronesResponse);
+  rpc GetDrone(GetDroneRequest) returns (Drone);
+  rpc DeleteDrone(DeleteDroneRequest) returns (google.protobuf.Empty);
+  rpc GetDroneLogs(GetDroneLogsRequest) returns (stream GetDroneLogsResponse);
+  rpc ExecDrone(stream ExecDroneRequest) returns (stream ExecDroneResponse);
+  rpc DrainDrone(DrainDroneRequest) returns (DrainDroneResponse);
+}
