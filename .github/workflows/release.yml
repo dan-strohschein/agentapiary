@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+          
+          # macOS builds
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+          
+          # Windows builds
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+          - os: windows
+            arch: arm64
+            runner: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        shell: bash
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          LDFLAGS="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE"
+          
+          # Build apiaryd
+          go build -ldflags "$LDFLAGS" -o bin/apiaryd${{ matrix.os == 'windows' && '.exe' || '' }} ./cmd/apiaryd
+          
+          # Build apiaryctl
+          go build -ldflags "$LDFLAGS" -o bin/apiaryctl${{ matrix.os == 'windows' && '.exe' || '' }} ./cmd/apiaryctl
+          
+          # Build keeper
+          go build -ldflags "$LDFLAGS" -o bin/keeper${{ matrix.os == 'windows' && '.exe' || '' }} ./cmd/keeper
+
+      - name: Create archive (Linux/macOS)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="apiary_${{ steps.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+          tar -czf "$ARCHIVE_NAME" -C bin apiaryd apiaryctl keeper
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Create archive (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $archiveName = "apiary_${{ steps.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.zip"
+          Compress-Archive -Path bin/apiaryd.exe, bin/apiaryctl.exe, bin/keeper.exe -DestinationPath $archiveName
+          echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            shasum -a 256 $ARCHIVE_NAME > $ARCHIVE_NAME.sha256
+          else
+            sha256sum $ARCHIVE_NAME > $ARCHIVE_NAME.sha256
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apiary-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            apiary_*.*
+            *.sha256
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p ./release-assets
+          find ./artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} ./release-assets/ \;
+          ls -lh ./release-assets/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git describe --abbrev=0 --tags $(git rev-list --tags --skip=1 --max-count=1) 2>/dev/null || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            echo "## What's New" > changelog.md
+            echo "" >> changelog.md
+            echo "Initial release of Agent Apiary v${{ steps.version.outputs.version }}" >> changelog.md
+          else
+            echo "## What's New" > changelog.md
+            echo "" >> changelog.md
+            git log $PREV_TAG..HEAD --pretty=format:"- %s (%h)" >> changelog.md
+          fi
+          
+          echo "" >> changelog.md
+          echo "" >> changelog.md
+          echo "## Installation" >> changelog.md
+          echo "" >> changelog.md
+          echo "### Linux / macOS" >> changelog.md
+          echo '```bash' >> changelog.md
+          echo "# Download the appropriate archive for your OS and architecture" >> changelog.md
+          echo "tar -xzf apiary_${{ steps.version.outputs.version }}_linux_amd64.tar.gz" >> changelog.md
+          echo "" >> changelog.md
+          echo "# Move binaries to your PATH" >> changelog.md
+          echo "sudo mv apiaryd apiaryctl keeper /usr/local/bin/" >> changelog.md
+          echo '```' >> changelog.md
+          echo "" >> changelog.md
+          echo "### Windows" >> changelog.md
+          echo '```powershell' >> changelog.md
+          echo "# Extract the zip file" >> changelog.md
+          echo "# Add the directory containing the .exe files to your PATH" >> changelog.md
+          echo '```' >> changelog.md
+          echo "" >> changelog.md
+          echo "## Checksums" >> changelog.md
+          echo "" >> changelog.md
+          echo "SHA256 checksums are provided for each archive. Verify with:" >> changelog.md
+          echo '```bash' >> changelog.md
+          echo "sha256sum -c apiary_${{ steps.version.outputs.version }}_linux_amd64.tar.gz.sha256" >> changelog.md
+          echo '```' >> changelog.md
+          
+          cat changelog.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          body_path: changelog.md
+          draft: false
+          prerelease: false
+          files: ./release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
