@@ -38,7 +38,7 @@ func AuthorizationMiddleware(rbac *RBAC, config ...AuthorizationConfig) echo.Mid
 			// Get principal from context
 			principal, ok := PrincipalFromContext(c.Request().Context())
 			if !ok {
-				// Authentication required by default
+				// No principal - check if authentication is required
 				if cfg.RequireAuth {
 					return c.JSON(http.StatusUnauthorized, map[string]string{
 						"error":   "unauthorized",
@@ -49,6 +49,13 @@ func AuthorizationMiddleware(rbac *RBAC, config ...AuthorizationConfig) echo.Mid
 				return next(c)
 			}
 
+			// Principal exists - if RequireAuth is false (MVP mode), allow all requests
+			if !cfg.RequireAuth {
+				// MVP/development mode: allow all requests even if principal has no permissions
+				return next(c)
+			}
+
+			// RequireAuth is true: check permissions
 			// Determine permission based on HTTP method
 			var permission Permission
 			switch c.Request().Method {

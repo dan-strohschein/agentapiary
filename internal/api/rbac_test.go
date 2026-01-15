@@ -46,7 +46,7 @@ func setupTestServerWithRBAC(t *testing.T) (*Server, *auth.RBAC, func()) {
 }
 
 func TestRBAC_AssignRole(t *testing.T) {
-	server, _, cleanup := setupTestServerWithRBAC(t)
+	server, rbac, cleanup := setupTestServerWithRBAC(t)
 	defer cleanup()
 
 	// Create a cell first
@@ -64,6 +64,15 @@ func TestRBAC_AssignRole(t *testing.T) {
 	err := server.store.Create(context.Background(), cell)
 	require.NoError(t, err)
 
+	// Assign admin role to admin-user so they can manage roles
+	err = rbac.AssignRole("test-cell", "admin-user", auth.RoleAdmin)
+	require.NoError(t, err)
+
+	// Verify the role was assigned correctly
+	role, exists := rbac.GetRole("test-cell", "admin-user")
+	require.True(t, exists, "admin-user should have a role assigned")
+	assert.Equal(t, auth.RoleAdmin, role, "admin-user should have admin role")
+
 	reqBody := map[string]interface{}{
 		"userId": "user1",
 		"role":   "admin",
@@ -73,10 +82,16 @@ func TestRBAC_AssignRole(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/cells/test-cell/roles", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", "admin-user")
+	req.Header.Set("X-User-Name", "Admin User")
 	rec := httptest.NewRecorder()
 
 	server.echo.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusCreated {
+		t.Logf("Response status: %d", rec.Code)
+		t.Logf("Response body: %s", rec.Body.String())
+	}
 	assert.Equal(t, http.StatusCreated, rec.Code)
 }
 
@@ -99,6 +114,15 @@ func TestRBAC_ListRoles(t *testing.T) {
 	err := server.store.Create(context.Background(), cell)
 	require.NoError(t, err)
 
+	// Assign admin role to admin-user so they can read roles
+	err = rbac.AssignRole("test-cell", "admin-user", auth.RoleAdmin)
+	require.NoError(t, err)
+
+	// Verify the role was assigned correctly
+	role, exists := rbac.GetRole("test-cell", "admin-user")
+	require.True(t, exists, "admin-user should have a role assigned")
+	assert.Equal(t, auth.RoleAdmin, role, "admin-user should have admin role")
+
 	// Assign some roles
 	err = rbac.AssignRole("test-cell", "user1", auth.RoleAdmin)
 	require.NoError(t, err)
@@ -106,16 +130,24 @@ func TestRBAC_ListRoles(t *testing.T) {
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/cells/test-cell/roles", nil)
+	req.Header.Set("X-User-ID", "admin-user")
+	req.Header.Set("X-User-Name", "Admin User")
 	rec := httptest.NewRecorder()
 
 	server.echo.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusOK {
+		t.Logf("Response status: %d", rec.Code)
+		t.Logf("Response body: %s", rec.Body.String())
+	}
 	assert.Equal(t, http.StatusOK, rec.Code)
 
 	var roles map[string]string
 	err = json.Unmarshal(rec.Body.Bytes(), &roles)
 	require.NoError(t, err)
-	assert.Len(t, roles, 2)
+	// Should have 3 roles: admin-user (added for permission), user1, and user2
+	assert.Len(t, roles, 3)
+	assert.Equal(t, "admin", roles["admin-user"])
 	assert.Equal(t, "admin", roles["user1"])
 	assert.Equal(t, "developer", roles["user2"])
 }
@@ -139,19 +171,34 @@ func TestRBAC_RemoveRole(t *testing.T) {
 	err := server.store.Create(context.Background(), cell)
 	require.NoError(t, err)
 
+	// Assign admin role to admin-user so they can remove roles
+	err = rbac.AssignRole("test-cell", "admin-user", auth.RoleAdmin)
+	require.NoError(t, err)
+
+	// Verify the role was assigned correctly
+	role, exists := rbac.GetRole("test-cell", "admin-user")
+	require.True(t, exists, "admin-user should have a role assigned")
+	assert.Equal(t, auth.RoleAdmin, role, "admin-user should have admin role")
+
 	// Assign a role
 	err = rbac.AssignRole("test-cell", "user1", auth.RoleAdmin)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/cells/test-cell/roles/user1", nil)
+	req.Header.Set("X-User-ID", "admin-user")
+	req.Header.Set("X-User-Name", "Admin User")
 	rec := httptest.NewRecorder()
 
 	server.echo.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusNoContent {
+		t.Logf("Response status: %d", rec.Code)
+		t.Logf("Response body: %s", rec.Body.String())
+	}
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 
-	_, exists := rbac.GetRole("test-cell", "user1")
-	assert.False(t, exists)
+	_, existsUser1 := rbac.GetRole("test-cell", "user1")
+	assert.False(t, existsUser1)
 }
 
 func TestRBAC_Authorization_Admin(t *testing.T) {
@@ -383,7 +430,32 @@ func TestRBAC_Authorization_Developer_CannotDelete(t *testing.T) {
 }
 
 func TestRBAC_Authorization_NoPrincipal_Allowed(t *testing.T) {
-	server, _, cleanup := setupTestServerWithRBAC(t)
+	// Create a server that allows unauthenticated access (MVP mode)
+	tmpDir := t.TempDir()
+	store, err := badger.NewStore(tmpDir)
+	require.NoError(t, err)
+
+	logger := zap.NewNop()
+	rbac := auth.NewRBAC()
+
+	requireAuth := false
+	cfg := Config{
+		Port:        8080,
+		Store:       store,
+		RBAC:        rbac,
+		Logger:      logger,
+		RequireAuth: &requireAuth, // Allow unauthenticated access for MVP
+	}
+
+	server, err := NewServer(cfg)
+	require.NoError(t, err)
+
+	cleanup := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
+		store.Close()
+	}
 	defer cleanup()
 
 	// Create a cell
@@ -398,7 +470,7 @@ func TestRBAC_Authorization_NoPrincipal_Allowed(t *testing.T) {
 			UpdatedAt: time.Now(),
 		},
 	}
-	err := server.store.Create(context.Background(), cell)
+	err = server.store.Create(context.Background(), cell)
 	require.NoError(t, err)
 
 	// Try to create an agent spec without principal (should be allowed for MVP)
@@ -428,7 +500,7 @@ func TestRBAC_Authorization_NoPrincipal_Allowed(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/cells/test-cell/agentspecs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	// No X-User-ID header
+	// No X-User-ID header - unauthenticated request should be allowed
 	rec := httptest.NewRecorder()
 
 	server.echo.ServeHTTP(rec, req)

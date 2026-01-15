@@ -46,6 +46,11 @@ type Config struct {
 	DLQManager     *dlq.Manager
 	Logger         *zap.Logger
 	Observability  *observability.Observability
+	// RequireAuth determines if authentication is required for namespaced endpoints.
+	// If false, unauthenticated requests are allowed (MVP/development mode).
+	// Default: true (require authentication). Use *RequireAuth pointer to distinguish
+	// between unset (default true) and explicitly false.
+	RequireAuth    *bool
 }
 
 // NewServer creates a new API server.
@@ -74,7 +79,19 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Authorization middleware (checks permissions)
 	if cfg.RBAC != nil {
-		e.Use(auth.AuthorizationMiddleware(cfg.RBAC))
+		// Default: require authentication (if RequireAuth is nil or true)
+		requireAuth := true // default to true
+		if cfg.RequireAuth != nil {
+			requireAuth = *cfg.RequireAuth
+		}
+		
+		if requireAuth {
+			// Default behavior: require authentication
+			e.Use(auth.AuthorizationMiddleware(cfg.RBAC))
+		} else {
+			// MVP/development mode: allow unauthenticated access
+			e.Use(auth.AuthorizationMiddleware(cfg.RBAC, auth.AuthorizationConfig{RequireAuth: false}))
+		}
 	}
 
 	// CORS
